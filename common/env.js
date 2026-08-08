@@ -63,6 +63,8 @@ const init = (Env, mainConfig, pluginModules) => {
 
     Env.numberStorages = infra.storage.length;
     Env.numberCores = infra.core.length;
+    // federation is optional: an instance that does not federate has none
+    Env.numberFederations = infra.federation?.length || 0;
 
     // TODO: implement storage migration later (in /storage/)
     Env.Util = Util;
@@ -82,6 +84,16 @@ const init = (Env, mainConfig, pluginModules) => {
         const key = Buffer.from(data.slice(0, 8));
         const id = jumpConsistentHash(key, Env.numberCores);
         return 'core:' + id;
+    };
+    /*  Peer -> federation node ownership (federation design §1.2). Hashing the
+        peer's originId rather than a channel is what keeps one session per peer
+        instead of one per peer per shard. */
+    Env.getFederationId = originId => {
+        if (!Env.numberFederations) { return; }
+        const data = Util.escapeKeyCharacters(originId || '') + '00000000';
+        const key = Buffer.from(data.slice(0, 8));
+        const id = jumpConsistentHash(key, Env.numberFederations);
+        return 'federation:' + id;
     };
 
     // Set Env.maxWorkers and Env.maxJobs

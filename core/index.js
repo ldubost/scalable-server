@@ -89,6 +89,228 @@ let storageToFront = function(command) {
     };
 };
 
+/*  Federation liveness probe (federation design §1.3, milestone M0).
+
+    A federation node asks core to reach the storage tier on its behalf. This is
+    the only federation command core routes in M0, and it exists to prove the
+    federation -> core -> storage path that every later federation flow depends
+    on. It carries no channel and touches no pad data.
+*/
+const onFedPing = (args, cb, extra) => {
+    if (!/^federation:/.test(extra?.from || '')) {
+        Env.Log.error('UNAUTHORIZED_USER_ERROR', 'FED_PING',
+            'received from unauthorized server:', extra?.from);
+        return void cb('UNAUTHORIZED_USER');
+    }
+    /*  Route on the originId so the probe lands on a real storage node chosen
+        the same way a channel would be, rather than always storage:0. */
+    const storageId = Env.getStorageId(args?.originId || '');
+    Env.interface.sendQuery(storageId, 'FED_PING', {
+        originId: args?.originId,
+        nonce: args?.nonce
+    }, response => {
+        cb(response.error, response.data);
+    });
+};
+
+/*  Public federation descriptor, for /api/federation (spec R-23).
+
+    Front nodes cannot reach federation nodes directly — nothing can, except
+    through core — so this hop exists to let the public endpoint publish the
+    instance key. An instance with no federation nodes answers ENOFEDERATION,
+    which the endpoint turns into an honest "this instance does not federate"
+    rather than an error.
+*/
+const onFederationInfo = (args, cb) => {
+    if (!Env.numberFederations) { return void cb('ENOFEDERATION'); }
+    Env.interface.sendQuery('federation:0', 'FED_STATUS', {}, response => {
+        cb(response.error, response.data);
+    });
+};
+
+/*  Ask this instance to start mirroring a channel from a peer (design §5.2).
+
+    Authorisation is the capability, which is signed by the pad's own key — so
+    the caller proves the right to replicate the same way they would prove the
+    right to write. The federation node verifies it, and the peering policy
+    applies regardless of what the capability says.
+*/
+/*  Which instances this one may federate with. The client needs a peer's id to
+    scope a capability to it, and must not ask that peer directly. */
+const onFederationPeers = (args, cb, extra) => {
+    if (!isFrontCmd(extra?.from || '')) { return void cb('UNAUTHORIZED'); }
+    if (!Env.numberFederations) { return void cb('ENOFEDERATION'); }
+    Env.interface.sendQuery('federation:0', 'FED_PEERS', {}, response => {
+        cb(response.error, response.data);
+    });
+};
+
+const onFederationEnable = (args, cb, extra) => {
+    if (!isFrontCmd(extra?.from || '')) { return void cb('UNAUTHORIZED'); }
+    if (!Env.numberFederations) { return void cb('ENOFEDERATION'); }
+    const channel = args?.channel;
+    if (!isValidChannel(channel)) { return void cb('INVALID_CHAN'); }
+    Env.interface.sendQuery(Env.getFederationId(channel), 'FED_ENABLE_LOCAL', args,
+        response => { cb(response.error, response.data); });
+};
+
+/*  Is this channel federated, and with whom (R-50)?
+
+    The client needs this to federate a pad's auxiliary channels — the pad chat
+    is created lazily, often long after the pad was federated, and only the
+    client can name it. Without a way to ask, a chat opened after federation
+    would never replicate.
+
+    It discloses no more than the channel id already does: knowing the id is
+    what grants access to a CryptPad channel in the first place, and the member
+    list is the operator's own peer list, already public at
+    /api/federation/peers.
+*/
+const onFederationChannelStatus = (args, cb, extra) => {
+    if (!isFrontCmd(extra?.from || '')) { return void cb('UNAUTHORIZED'); }
+    if (!Env.numberFederations) { return void cb('ENOFEDERATION'); }
+    const channel = args?.channel;
+    if (!isValidChannel(channel)) { return void cb('INVALID_CHAN'); }
+    Env.interface.sendQuery(Env.getFederationId(channel), 'FED_CHANNEL_STATUS',
+        { channel }, response => { cb(response.error, response.data); });
+};
+
+const onFederationReplicate = (args, cb, extra) => {
+    if (!isFrontCmd(extra?.from || '')) { return void cb('UNAUTHORIZED'); }
+    if (!Env.numberFederations) { return void cb('ENOFEDERATION'); }
+    const channel = args?.channel;
+    if (!isValidChannel(channel)) { return void cb('INVALID_CHAN'); }
+    Env.interface.sendQuery(Env.getFederationId(channel), 'FED_REPLICATE', args,
+        response => { cb(response.error, response.data); });
+};
+
+/*  Federation commands routed from a federation node to the storage node that
+    owns the channel (design §1.3). Every one of them is a write or a read of a
+    channel's log, so they route on the channel exactly as a front command does.
+
+    The `extra.from` check is the authorisation boundary: these bypass the
+    account layer entirely, so nothing but a federation node may reach them.
+*/
+/*  A control commit made here, on its way out to the replicas (spec §5.4).
+
+    Emitted by storage after it has applied the change locally, so replication
+    can never run ahead of the anchor's own state. Fire-and-forget: a peer that
+    misses it is repaired by the next anti-entropy sync, exactly like a missed
+    PUBLISH.
+*/
+const onFedControlOut = (args, cb, extra) => {
+    cb ||= () => {};
+    if (!isStorageCmd(extra?.from || '')) { return void cb('UNAUTHORIZED_USER'); }
+    const channel = args?.channel;
+    if (!isValidChannel(channel) || !Env.numberFederations) { return void cb(); }
+    const fedId = Env.getFederationId(channel);
+    if (!fedId) { return void cb(); }
+    Env.interface.sendEvent(fedId, 'FED_CONTROL_OUT', args);
+    cb();
+};
+
+const federationToStorage = (command, storageCommand) => {
+    return function (args, cb, extra) {
+        if (!/^federation:/.test(extra?.from || '')) {
+            Env.Log.error('UNAUTHORIZED_USER_ERROR', command,
+                'received from unauthorized server:', extra?.from);
+            return void cb('UNAUTHORIZED_USER');
+        }
+        const channel = args?.channel;
+        if (!isValidChannel(channel)) { return void cb('INVALID_CHAN'); }
+        Env.interface.sendQuery(Env.getStorageId(channel),
+            storageCommand || command, args, response => {
+                cb(response.error, response.data);
+            });
+    };
+};
+
+/*  Blob commands route on the blob id rather than a channel: a blob belongs to
+    no channel as far as any server knows, since the reference to it lives inside
+    content nothing can read. The same jump hash is used, so every node agrees
+    which storage node owns a given blob. */
+const federationToBlobStorage = (command) => {
+    return function (args, cb, extra) {
+        if (!/^federation:/.test(extra?.from || '')) {
+            return void cb('UNAUTHORIZED_USER');
+        }
+        const id = args?.id;
+        if (typeof (id) !== 'string' || !/^[a-f0-9]{48}$/.test(id)) {
+            return void cb('EBADBLOBID');
+        }
+        Env.interface.sendQuery(Env.getStorageId(id), command, args, response => {
+            cb(response.error, response.data);
+        });
+    };
+};
+
+/*  A storage node is missing a blob a user asked for, and wants federation to
+    try the peers. Routed to the federation node that owns... any peer: the
+    fetch tries each live session in turn, so node 0 is as good as any. */
+const onFedBlobFetch = (args, cb, extra) => {
+    if (!isStorageCmd(extra?.from || '')) { return void cb('UNAUTHORIZED_USER'); }
+    if (!Env.numberFederations) { return void cb('ENOFEDERATION'); }
+    Env.interface.sendQuery('federation:0', 'FED_BLOB_FETCH', args, response => {
+        cb(response.error, response.data);
+    });
+};
+
+/*  Live fan-out to federation (milestone M1).
+
+    Core already sees every message that storage has committed, on its way to the
+    front nodes. Hanging the federation publish off that point means the storage
+    hot path — `channel-manager.js`, which every message on the instance passes
+    through — needs no edit at all in M1.
+
+    The cost to a non-federated channel is one Set lookup. `federatedChannels` is
+    populated when a channel is federated and on notification from storage; a
+    channel missing from it is simply not published, and the peer's next
+    anti-entropy sync picks up anything that was missed. That is the right
+    failure direction: the sync is authoritative, the live push is an optimisation.
+*/
+Env.federatedChannels = new Set();
+/*  Channels this instance mirrors rather than anchors (M2). A local write on one
+    of these may not be committed here — it is forwarded to the anchor, which is
+    the single ordering authority. Kept as a Set so the write path costs a lookup
+    rather than a round trip. */
+Env.mirroredChannels = new Set();
+/*  Channels running multi-master (L2, M3): no anchor, every member writes, and
+    the merge derives the order. Disjoint from `mirroredChannels`. */
+Env.multiMasterChannels = new Set();
+
+const publishToFederation = (message) => {
+    if (!Env.numberFederations) { return; }
+    const channel = message?.[3];
+    if (!channel) { return; }
+    if (!Env.federatedChannels.has(channel)) { return; }
+    const content = message[4];
+    if (typeof (content) !== 'string') { return; }
+
+    /*  Route on the channel, not the peer: the federation node that publishes a
+        channel is the one that will hold its merge state in M3. */
+    const fedId = Env.getFederationId(channel);
+    if (!fedId) { return; }
+    Env.interface.sendEvent(fedId, 'FED_LOCAL_MESSAGE', {
+        channel, content, time: message[5]
+    });
+};
+
+// storage tells core which channels are federated, so the fan-out stays cheap
+const onFederationChannels = (args, cb, extra) => {
+    if (!isStorageCmd(extra?.from || '') && !/^federation:/.test(extra?.from || '')) {
+        return void cb('UNAUTHORIZED_USER');
+    }
+    const { channel, federated } = args || {};
+    if (!isValidChannel(channel)) { return void cb('INVALID_CHAN'); }
+    if (federated) { Env.federatedChannels.add(channel); }
+    else { Env.federatedChannels.delete(channel); }
+    if (federated && args.mirror) { Env.mirroredChannels.add(channel); }
+    else { Env.mirroredChannels.delete(channel); }
+    if (federated && args.level === 'L2') { Env.multiMasterChannels.add(channel); }
+    else { Env.multiMasterChannels.delete(channel); }
+    cb();
+};
+
 const authenticateUser = (userId, unsafeKey, extra) => {
     const user = Env.userCache[userId] ||= {};
     if (!user.from) { user.from = extra.from; }
@@ -143,6 +365,32 @@ const sendChannelMessage = (users, message) => {
         });
     });
 };
+
+/*  A mirror's write, arriving at the anchor (M2).
+
+    Deliberately the same storage call a local write makes, so the content is
+    validated against `validateKey` (R-15), checkpoint dedup applies, and the
+    fan-out to local users and to every other replica happens through one
+    mechanism rather than two.
+*/
+const onFedWrite = (args, cb, extra) => {
+    if (!/^federation:/.test(extra?.from || '')) { return void cb('UNAUTHORIZED_USER'); }
+    const { channel, msgStruct } = args || {};
+    if (!isValidChannel(channel) || !Array.isArray(msgStruct)) {
+        return void cb('EINVAL');
+    }
+    Env.interface.sendQuery(Env.getStorageId(channel), 'CHANNEL_MESSAGE', {
+        channel, msgStruct, validated: false
+    }, res => {
+        if (res.error) { return void cb(res.error); }
+        if (!res?.data?.message) { return void cb(); }   // duplicate checkpoint
+        const { users, message } = res.data;
+        sendChannelMessage(users, message);
+        publishToFederation(message);
+        cb();
+    });
+};
+
 
 // Event: when a user is disconnected, remove it from all its channels
 const dropUser = (args, _cb, extra) => {
@@ -229,6 +477,46 @@ const onChannelMessage = (args, cb, extra) => {
         return void cb('EINVAL');
     }
 
+    /*  Anchored write-through (M2, conformance L1).
+
+        On a channel we mirror, we are not the ordering authority: committing
+        here would fork the log. Hand it to the anchor instead and acknowledge
+        the client only once the anchor has taken it. The message arrives back
+        through the normal PUBLISH path, so nothing echoes it locally.
+
+        If the anchor is unreachable the write fails with a typed error rather
+        than being accepted — a mirror that keeps accepting writes during a
+        partition is precisely what L1 exists to prevent. */
+    /*  L2 (M3): every member accepts writes. The federation node takes it,
+        assigns a Lamport clock, makes it durable in the pending log and pushes
+        it to the peers; it enters history when the merge lets it (R-3). The
+        client is acknowledged as soon as it is durable (R-9), not when it
+        commits (R-7). */
+    if (Env.multiMasterChannels.has(channel)) {
+        const fedId = Env.getFederationId(channel);
+        if (!fedId) { return void cb('ENOFEDERATION'); }
+        return void Env.interface.sendQuery(fedId, 'FED_ACCEPT', {
+            channel, content: msgStruct[4], msgStruct
+        }, res => {
+            if (res?.error) { return void cb(res.error); }
+            /*  Broadcast to our own users straight away. The committed order is
+                settled later by the merge; the live tier has always been
+                best-effort and separate (spec §1.6, §4.4). */
+            const message = msgStruct.slice();
+            message.push(+new Date());
+            if (res?.data?.users) { sendChannelMessage(res.data.users, message); }
+            cb();
+        });
+    }
+
+    if (Env.mirroredChannels.has(channel)) {
+        const fedId = Env.getFederationId(channel);
+        if (!fedId) { return void cb('ENOFEDERATION'); }
+        return void Env.interface.sendQuery(fedId, 'FED_WRITE_THROUGH', {
+            channel, content: msgStruct[4]
+        }, res => { cb(res?.error); });
+    }
+
     const todo = (validated) => {
         const storageId = Env.getStorageId(channel);
         Env.interface.sendQuery(storageId, 'CHANNEL_MESSAGE', {
@@ -244,6 +532,14 @@ const onChannelMessage = (args, cb, extra) => {
             const { users, message } = res.data;
 
             sendChannelMessage(users, message);
+            /*  ...and out to any federated replicas (M1).
+
+                This is the write path every ordinary message takes: core answers
+                the CHANNEL_MESSAGE *query* by fanning out itself, so the
+                SEND_CHANNEL_MESSAGE event never fires here. Hooking it at this
+                point still leaves storage/channel-manager.js untouched, which is
+                the property worth keeping.  */
+            publishToFederation(message);
             cb();
         });
     };
@@ -706,6 +1002,39 @@ const startServers = (mainConfig) => {
         'GET_MULTIPLE_FILE_SIZE': onGetMultipleFileSize,
 
         'STORAGE_FRONT': onStorageToFront,
+
+        // From Federation
+        'FED_PING': onFedPing,
+        'FED_ENABLE': federationToStorage('FED_ENABLE'),
+        'FED_STATE': federationToStorage('FED_STATE'),
+        'FED_SINCE': federationToStorage('FED_SINCE'),
+        'FED_HEAD': federationToStorage('FED_HEAD'),
+        'FED_INGEST': federationToStorage('FED_INGEST'),
+        'FED_CHANNELS': onFederationChannels,
+        'FED_WRITE': onFedWrite,
+        'FED_CONTROL_OUT': onFedControlOut,
+        'FED_CONTROL': federationToStorage('FED_CONTROL'),
+        // the anchor's metadata, so a new replica can seed its own (R-21)
+        'FED_METADATA': federationToStorage('FED_METADATA', 'GET_METADATA'),
+        // blobs (R-44): no channel, so routed on the blob id instead
+        'FED_BLOB_STAT': federationToBlobStorage('FED_BLOB_STAT'),
+        'FED_BLOB_READ': federationToBlobStorage('FED_BLOB_READ'),
+        'FED_BLOB_WRITE': federationToBlobStorage('FED_BLOB_WRITE'),
+        'FED_BLOB_FETCH': onFedBlobFetch,
+        // L2 (M3)
+        'FED_ALLOCATE': federationToStorage('FED_ALLOCATE'),
+        'FED_ACCEPT_REMOTE': federationToStorage('FED_ACCEPT_REMOTE'),
+        'FED_OBSERVE': federationToStorage('FED_OBSERVE'),
+        'FED_TAIL': federationToStorage('FED_TAIL'),
+        'FED_RECONCILE': federationToStorage('FED_RECONCILE'),
+        'FED_HAVE': federationToStorage('FED_HAVE'),
+        'FED_TRIM': federationToStorage('FED_TRIM'),
+        // From Front, about federation
+        'FEDERATION_INFO': onFederationInfo,
+        'FEDERATION_REPLICATE': onFederationReplicate,
+        'FEDERATION_PEERS': onFederationPeers,
+        'FEDERATION_ENABLE': onFederationEnable,
+        'FEDERATION_CHANNEL_STATUS': onFederationChannelStatus,
     };
     queriesToStorage.forEach(function(command) {
         COMMANDS[command] = frontToStorage(command);

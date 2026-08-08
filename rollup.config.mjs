@@ -106,6 +106,18 @@ if (!type || type === "storage") {
         plugins: getPlugins()
     });
 }
+if (!type || type === "federation") {
+    list.push({
+        input: "./federation/federation.ts",
+        output: [{
+            name: 'cryptpad-server-federation',
+            file: "./build/federation.js",
+            format: "cjs",
+            plugins: [ getTerser() ]
+        }],
+        plugins: getPlugins()
+    });
+}
 if (!type || type === "http") {
     list.push({
         input: "./http-server/http-server.ts",

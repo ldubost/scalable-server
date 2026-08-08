@@ -128,9 +128,11 @@ Data.setMetadata = (Env, data, cb) => {
                     return void next();
                 }
 
-                // send the message back to the person who changed it
-                // since we know they're allowed to see it
-                cb(void 0, metadata);
+                /*  The third argument is the command line that was actually
+                    written. Federation replicates the *command*, not the
+                    resulting state, so that every replica's metadata stays a
+                    pure function of the commands applied (spec R-20). */
+                cb(void 0, metadata, line);
                 next();
 
                 const metadata_cache = Env.metadata_cache;

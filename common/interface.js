@@ -276,7 +276,8 @@ const init = (config, cb) => {
             storage: [],
             core: [],
             http: [],
-            front: []
+            front: [],
+            federation: []
         },
         commands: {},
         queue: [],

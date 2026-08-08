@@ -12,6 +12,10 @@ const nThen = require("nthen");
 
 const HistoryManager = require("./history-manager.js");
 const ChannelManager = require("./channel-manager.js");
+const FederationManager = require("./federation/manager.js");
+const FederationBlobs = require("./federation/blobs.js");
+const Merge = require("./federation/merge.js");
+const Backends = require("../common/storage/backend/index.js");
 const HKUtil = require("./hk-util.js");
 const MFAManager = require('./mfa-manager.js');
 
@@ -58,6 +62,12 @@ const Env = {
     queueStorage: WriteQueue(),
     queueValidation: WriteQueue(),
     queueMetadata: WriteQueue(),
+    /*  Federation state is read-modify-written by several paths at once —
+        accepting a local write, accepting a peer's, observing a heartbeat, and
+        the merge. They all use a conditional put, so without serialising them
+        one loses the race and its update is silently dropped. Its own queue,
+        not queueStorage, because the merge appends to the log while holding it. */
+    queueFederation: WriteQueue(),
     queueDeletes: WriteQueue(),
     batchIndexReads: BatchRead("HK_GET_INDEX"),
     batchMetadata: BatchRead("GET_METADATA"),
@@ -361,8 +371,31 @@ const getRegisteredUsersHandler = (args, cb) => {
     Pinning.getRegisteredUsers(Env, cb, true);
 };
 
+/*  Metadata on a federated channel is anchor-authoritative (spec §6, L1).
+
+    A mirror must not mutate it: the two replicas would drift apart with no
+    mechanism to reconcile them, and R-20 says metadata has to be a pure function
+    of the replicated command sequence. So the mirror refuses, and the anchor
+    replicates each accepted command as a META control commit.
+*/
 const setMetadataHandler = (args, cb) => {
-    Metadata.setMetadata(Env, args, cb);
+    const channel = args?.channel;
+    const isAnchor = Env.FM.isAnchor(channel);
+    if (isAnchor === false) {
+        return void cb('EFEDERATED_MIRROR');
+    }
+    Metadata.setMetadata(Env, args, (err, metadata, line) => {
+        cb(err, metadata);
+        if (err || !isAnchor || !line) { return; }
+        /*  Replicate the command, not the resulting state: applying the same
+            commands in the same order is what makes every replica's metadata a
+            pure function of the log (R-20). Shipping the state would paper over
+            a divergence instead of preventing one. */
+        Env.interface.sendEvent(Env.getCoreId(channel), 'FED_CONTROL_OUT', {
+            channel,
+            ctrl: { t: 'META', line }
+        });
+    });
 };
 const getMetadataHandler = (args, cb) => {
     HistoryManager.getMetadata(Env, args?.channel, cb);
@@ -415,6 +448,195 @@ const blockCheckHandler = (data, cb) => {
     BlockStore.check(Env, data.blockId, cb, true);
 };
 
+/*  Federation commands (milestone M1).
+
+    These are the storage half of the federation flows; they only ever arrive
+    from a federation node, routed through core, which checks the sender.
+
+    Note what is NOT here: nothing touches the local write path. A federated
+    channel is written by `channel-manager.js` exactly as before, and the
+    envelope for a local message is built afterwards from the committed log.
+    That is why M1 needs no edit to the hot path at all.
+*/
+
+// Enable replication for a channel. The capability was verified upstream.
+const fedEnableHandler = (data, cb) => {
+    const { channel, validateKey, self, origin, members, metadata, level } = data || {};
+    if (!Core.isValidId(channel)) { return void cb('INVALID_CHAN'); }
+    Env.FM.enable(channel, {
+        validateKey, self, origin, members, metadata, level
+    }, (err, state, info) => {
+        if (err) {
+            Env.Log.error('FEDERATION_ENABLE_ERROR', err.message || err);
+            return void cb(String(err.code || err.message || err));
+        }
+        if (!state) { return void cb('ENOSTATE'); }
+        Env.Log.info('FEDERATION_ENABLED', {
+            channel, members: state.members.length, already: Boolean(info?.already)
+        });
+        cb(void 0, { state: state, already: Boolean(info?.already) });
+    });
+};
+
+const fedStateHandler = (data, cb) => {
+    Env.FM.state(data?.channel, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        if (!res) { return void cb(); }
+        /*  `promise` is what the heartbeat must advertise: the clock this
+            instance guarantees not to go below. Advertising `self.lamport`
+            instead would pin a peer's watermark whenever we go quiet. */
+        cb(void 0, Object.assign({}, res.state, {
+            promise: Merge.promise(res.state)
+        }));
+    });
+};
+
+/*  Serve history as envelopes for SYNC_RES. `limit` bounds one response so a
+    large backfill is streamed over several exchanges rather than built in
+    memory in one go. */
+const fedSinceHandler = (data, cb) => {
+    const { channel, sinceId, limit } = data || {};
+    if (!Core.isValidId(channel)) { return void cb('INVALID_CHAN'); }
+    Env.FM.since(channel, sinceId, limit || 256, (err, messages) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, { messages });
+    });
+};
+
+const fedHeadHandler = (data, cb) => {
+    if (!Core.isValidId(data?.channel)) { return void cb('INVALID_CHAN'); }
+    Env.FM.head(data.channel, (err, info) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, info);
+    });
+};
+
+/*  Accept a remote envelope into the committed log. Revalidates content against
+    the channel's validateKey first (R-15) — a peer is never trusted about
+    content, only about its own ordering claim. */
+const fedIngestHandler = (data, cb) => {
+    const { channel, envelope } = data || {};
+    if (!Core.isValidId(channel)) { return void cb('INVALID_CHAN'); }
+    Env.FM.ingest(channel, envelope, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, res);
+    });
+};
+
+/*  L2 (M3): a local write goes to the pending log and waits for the watermark,
+    rather than being committed on arrival. The caller is acknowledged once it is
+    durable (R-9); it becomes part of history when the merge says so (R-3). */
+const fedAllocateHandler = (data, cb) => {
+    if (!Core.isValidId(data?.channel)) { return void cb('INVALID_CHAN'); }
+    Env.FM.allocate(data.channel, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, res);
+    });
+};
+
+const fedAcceptRemoteHandler = (data, cb) => {
+    const { channel, envelope } = data || {};
+    if (!Core.isValidId(channel)) { return void cb('INVALID_CHAN'); }
+    Env.FM.acceptRemote(channel, envelope, (err) => {
+        cb(err ? String(err.message || err) : void 0);
+    });
+};
+
+// a peer's clock from a heartbeat: what keeps the watermark moving when idle (R-4)
+const fedObserveHandler = (data, cb) => {
+    const { channel, originId, seq, lamport } = data || {};
+    if (!Core.isValidId(channel)) { return void cb('INVALID_CHAN'); }
+    Env.FM.observePeer(channel, originId, { seq, lamport }, (err) => {
+        cb(err ? String(err.message || err) : void 0);
+    });
+};
+
+/*  Anti-entropy (R-47): the peer tells us what it holds, we tell it what it is
+    missing of ours. */
+const fedReconcileHandler = (data, cb) => {
+    const { channel, originId, have } = data || {};
+    if (!Core.isValidId(channel)) { return void cb('INVALID_CHAN'); }
+    Env.FM.reconcile(channel, originId, have, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, res);
+    });
+};
+
+const fedHaveHandler = (data, cb) => {
+    Env.FM.have(data?.channel, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, { have: res });
+    });
+};
+
+const fedTailHandler = (data, cb) => {
+    Env.FM.tail(data?.channel, (err, tail) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, { tail });
+    });
+};
+
+const fedTrimHandler = (data, cb) => {
+    Env.FM.trim(data?.channel, data?.toLamport, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, res);
+    });
+};
+
+/*  Blobs (R-44). Immutable and content-addressed, so these are plain reads and
+    writes — no ordering, no merge, nothing to reconcile. */
+const fedBlobStatHandler = (data, cb) => {
+    Env.FB.stat(data?.id, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, res);
+    });
+};
+
+const fedBlobReadHandler = (data, cb) => {
+    Env.FB.read(data?.id, data?.offset || 0, data?.length, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        // base64 because this crosses the node bus as JSON
+        cb(void 0, { chunk: res.chunk.toString('base64'), total: res.total });
+    });
+};
+
+const fedBlobWriteHandler = (data, cb) => {
+    let buf;
+    try {
+        buf = Buffer.from(data?.data || '', 'base64');
+    } catch (e) { return void cb('EBADBLOB'); }
+    Env.FB.write(data?.id, buf, (err) => {
+        cb(err ? String(err.message || err) : void 0);
+    });
+};
+
+/*  A control commit from a peer: a metadata change or a deletion made at the
+    anchor (spec §5.4). Applied without re-checking the owner, which is the
+    trust-the-peer boundary R-28 describes. */
+const fedControlHandler = (data, cb) => {
+    const { channel, ctrl, from } = data || {};
+    if (!Core.isValidId(channel)) { return void cb('INVALID_CHAN'); }
+    Env.FM.control(channel, ctrl, from, (err) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb();
+    });
+};
+
+/*  Federation liveness probe (federation design §1.3, milestone M0).
+
+    The far end of the federation -> core -> storage path. It reports that this
+    storage node is up and which node answered, so the M0 round trip proves a
+    real hop rather than core answering on storage's behalf. No channel is read
+    and no data is written; the federated log arrives in M1.
+*/
+const fedPingHandler = (data, cb) => {
+    cb(void 0, {
+        storageId: Env.myId,
+        nonce: data?.nonce,
+        time: +new Date()
+    });
+};
+
 /* Start of the node */
 
 const callWithEnv = f => {
@@ -445,6 +667,24 @@ let COMMANDS = {
     'GET_REGISTERED_USERS': getRegisteredUsersHandler,
 
     'GET_METADATA': getMetadataHandler,
+
+    'FED_PING': fedPingHandler,
+    'FED_ENABLE': fedEnableHandler,
+    'FED_STATE': fedStateHandler,
+    'FED_SINCE': fedSinceHandler,
+    'FED_HEAD': fedHeadHandler,
+    'FED_INGEST': fedIngestHandler,
+    'FED_CONTROL': fedControlHandler,
+    'FED_BLOB_STAT': fedBlobStatHandler,
+    'FED_BLOB_READ': fedBlobReadHandler,
+    'FED_BLOB_WRITE': fedBlobWriteHandler,
+    'FED_ALLOCATE': fedAllocateHandler,
+    'FED_ACCEPT_REMOTE': fedAcceptRemoteHandler,
+    'FED_OBSERVE': fedObserveHandler,
+    'FED_TAIL': fedTailHandler,
+    'FED_RECONCILE': fedReconcileHandler,
+    'FED_HAVE': fedHaveHandler,
+    'FED_TRIM': fedTrimHandler,
 
     'RPC_IS_NEW_CHANNEL': isNewChannelHandler,
     'RPC_WRITE_PRIVATE_MESSAGE': writePrivateMessageHandler,
@@ -934,6 +1174,28 @@ const start = (mainConfig) => {
             Env.storageBackend = stores.backend;
         }));
     }).nThen(waitFor => {
+        /*  Federation state needs an ObjectBackend. The object-storage path
+            already builds one, but the filesystem path uses the legacy file
+            store and has none — so make one, rooted at the instance's data
+            directory, which puts `fed/` alongside `channel/` as the design
+            describes.
+
+            Done unconditionally rather than on demand: it creates a directory
+            and nothing else, and a lazily-built backend would have to be
+            threaded through every call site as a maybe.  */
+        if (Env.storageBackend) {
+            Env.federationBackend = Env.storageBackend;
+            return;
+        }
+        Backends.create({ type: 'fs' }, { root: Env.paths.base }, waitFor((err, backend) => {
+            if (err) {
+                waitFor.abort();
+                Env.Log.error('FEDERATION_BACKEND_ERROR', err.message || err);
+                throw err;
+            }
+            Env.federationBackend = backend;
+        }));
+    }).nThen(waitFor => {
         /*  Reconcile the local cache against the store before serving anything.
 
             A node that died with writes it had acknowledged but not yet flushed
@@ -964,6 +1226,14 @@ const start = (mainConfig) => {
                 tasks_running = false;
             });
         }, 1000 * 60 * 5); // run every five minutes
+
+        /*  The merge has to be able to make progress without an incoming
+            message — see FM.sweep. Cheap: it iterates only channels this node
+            already holds federation state for, and does nothing at all on an
+            instance that federates nothing. */
+        Env.intervals.federationMerge = setInterval(() => {
+            Env.FM?.sweep();
+        }, 5000);
 
         Env.intervals.pinExpirationInterval = setInterval(() => {
             Core.expireSessions(Env.pin_cache);
@@ -1000,6 +1270,11 @@ const start = (mainConfig) => {
         initWorkerCommands();
 
         Env.CM = ChannelManager.create(Env);
+        /*  Federation state lives beside the channel log and is reached the same
+            way. Creating it is free for a non-federating instance: it opens no
+            keys until a channel is actually federated. */
+        Env.FM = FederationManager.create(Env);
+        Env.FB = FederationBlobs.create(Env);
 
         initHttpServer(Env, mainConfig, waitFor());
     }).nThen(waitFor => {

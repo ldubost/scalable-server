@@ -63,5 +63,24 @@ module.exports = {
             wsPort: 3041,
             serverId: ''
         }
-    ]
+    ],
+
+    /*  CryptPad-to-CryptPad federation (docs/federation-design.md).
+
+        Leave empty to disable federation entirely — no listener is opened and
+        the instance behaves exactly as it did before the feature existed. Peers
+        are listed separately, by instance public key, in data/peers.json.
+
+        Each node terminates peer sessions on `port` at the path /federation.
+        Give it TLS in production, either here or with a terminating proxy:
+
+            {
+                url: "",
+                host: "localhost",
+                port: 3050,
+                serverId: '',
+                tls: { cert: '/path/fullchain.pem', key: '/path/privkey.pem' }
+            }
+    */
+    "federation": []
 };

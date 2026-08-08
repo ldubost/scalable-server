@@ -36,6 +36,17 @@ module.exports = cryptoLib => {
                 SodiumNative.crypto_sign_ed25519_sk_to_pk(pk, secretKey);
                 return pk;
             };
+            exports.signKeyPair = () => {
+                const publicKey = Buffer.alloc(SodiumNative.crypto_sign_PUBLICKEYBYTES);
+                const secretKey = Buffer.alloc(SodiumNative.crypto_sign_SECRETKEYBYTES);
+                SodiumNative.crypto_sign_keypair(publicKey, secretKey);
+                return { publicKey, secretKey };
+            };
+            exports.detachedSign = (messageBuffer, secretKey) => {
+                const sig = Buffer.alloc(SodiumNative.crypto_sign_BYTES);
+                SodiumNative.crypto_sign_detached(sig, messageBuffer, secretKey);
+                return sig;
+            };
             break;
         default: // tweetNaCl
             NaCl = require("tweetnacl/nacl-fast");
@@ -45,6 +56,17 @@ module.exports = cryptoLib => {
             exports.secretboxOpen = NaCl.secretbox.open;
             exports.publicKeyFromSecretKey = (secretKey) => {
                 return NaCl.sign?.keyPair?.fromSecretKey(secretKey)?.publicKey;
+            };
+            exports.signKeyPair = () => {
+                const pair = NaCl.sign.keyPair();
+                return {
+                    publicKey: Buffer.from(pair.publicKey),
+                    secretKey: Buffer.from(pair.secretKey)
+                };
+            };
+            exports.detachedSign = (messageBuffer, secretKey) => {
+                return Buffer.from(NaCl.sign.detached(
+                    new Uint8Array(messageBuffer), new Uint8Array(secretKey)));
             };
             break;
     }

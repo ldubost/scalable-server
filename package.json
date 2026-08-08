@@ -60,10 +60,12 @@
     "build:front": "TYPE=front rollup -c",
     "build:core": "TYPE=core rollup -c",
     "build:storage": "TYPE=storage rollup -c",
+    "build:federation": "TYPE=federation rollup -c",
     "build:http": "TYPE=http rollup -c",
     "tests": "node --test tests/",
     "test": "node tests/runAll.js",
     "test:unit": "node --test tests/unit/*.test.js",
+    "test:integration": "node --test tests/integration/*.test.js",
     "start": "node index.js",
     "dev": "DEV=1 node index.js"
   }

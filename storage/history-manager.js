@@ -140,7 +140,28 @@ const getHistoryAsync = HistoryManager.getHistoryAsync = (Env, channel, lastKnow
             if (!parsed) { return void readMore(); }
             handler(parsed, readMore);
         }, waitFor(function(err, reason) {
-            return void cb(err, reason);
+            if (err) { return void cb(err, reason); }
+
+            /*  R-8: history is the committed prefix *plus* the uncommitted tail,
+                in `(l, o, id)` order.
+
+                On a multi-master channel a message is live before it is
+                committed, so a client that only received the committed prefix
+                would be missing the most recent edits — and would then be told
+                about them again later, out of order. Serving the sorted tail is
+                what makes a joining client see the same sequence as everyone
+                else. It is a no-op on any channel that is not federated.  */
+            if (!Env.FM || beforeHash) { return void cb(); }
+            Env.FM.tail(channel, (e, tail) => {
+                if (e || !tail || !tail.length) { return void cb(); }
+                let i = 0;
+                const next = () => {
+                    if (i >= tail.length) { return void cb(); }
+                    const env = tail[i++];
+                    handler([0, env.o, 'MSG', channel, env.m, env.t], next);
+                };
+                next();
+            });
         }));
     });
 };

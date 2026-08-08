@@ -52,6 +52,11 @@ entries to the `front`, `core` or `storage` arrays in `config/infra.js` — the
 http node load-balances across front nodes, and storage nodes are sharded by a
 consistent hash of each document id.
 
+There is a fifth, optional node type: `federation`, which holds sessions to other
+CryptPad instances. It is off by default (`federation: []`) and an instance with
+none behaves exactly as it did before the feature existed. See
+[federation-operating.md](federation-operating.md).
+
 The sandbox origin is not optional: the client refuses to load without it. In
 production it should be a genuinely different domain, not just a different port.
 

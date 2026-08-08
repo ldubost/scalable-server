@@ -178,21 +178,78 @@ HttpData.serve = (Env, opts) => {
     };
 };
 
+/*  Fetch a blob from a federated peer, the first time somebody asks for one we
+    do not have (spec R-44).
+
+    A pad's blobs are referenced from inside content no server can read, so they
+    cannot be replicated along with the channel log — nothing knows which blobs a
+    pad uses. Fetching on demand sidesteps that entirely: the reference is
+    resolved by whoever *can* read it, the browser, and the miss it produces is
+    what triggers the transfer. Blobs added long after federation was enabled are
+    covered by the same mechanism.
+
+    A miss costs one round trip to a peer; a hit costs a `head`. Instances with
+    no federation configured never get here.
+*/
+const federatedBlobFallback = (Env) => {
+    const inFlight = new Map();
+
+    return (req, res, next) => {
+        if (!Env.numberFederations) { return void next(); }
+        const id = (req.path || '').replace(/^\/+/, '').split('/').pop();
+        if (!/^[a-f0-9]{48}$/.test(id || '')) { return void next(); }
+
+        /*  Existence is checked through the blob store rather than the
+            federation helper: this middleware also runs in the storage *cluster*
+            process, which serves blobs over HTTP and has a blob store and a
+            proxied interface, but none of the federation state. */
+        if (!Env.blobStore?.isBlobAvailable) { return void next(); }
+
+        Env.blobStore.isBlobAvailable(id, (err, present) => {
+            if (err || present) { return void next(); }
+
+            /*  Two readers opening the same image must not start two transfers.
+                The second waits on the first, which is also what stops a popular
+                missing blob from stampeding every peer. */
+            if (inFlight.has(id)) {
+                return void inFlight.get(id).push(() => next());
+            }
+            const waiters = [];
+            inFlight.set(id, waiters);
+
+            Env.interface.sendQuery(Env.getCoreId(id), 'FED_BLOB_FETCH', { id },
+                (answer) => {
+                    inFlight.delete(id);
+                    if (answer?.error) {
+                        Env.Log.verbose('FEDERATION_BLOB_UNAVAILABLE',
+                            { id, error: answer.error });
+                    }
+                    next();
+                    waiters.forEach(w => w());
+                });
+        });
+    };
+};
+
 /*  Serve blobs: immutable once uploaded, so they can be cached hard. */
 HttpData.blobs = (Env, opts) => {
     opts = opts || {};
     const mode = resolveMode(Env, opts.mode);
+    const serve = (handler) => {
+        const fallback = federatedBlobFallback(Env);
+        return (req, res, next) => fallback(req, res, () => handler(req, res, next));
+    };
     if (mode === 'static') {
-        return Express.static(Path.resolve(Env.paths.blob), {
+        return serve(Express.static(Path.resolve(Env.paths.blob), {
             maxAge: Env.DEV_MODE ? "0d" : "365d"
-        });
+        }));
     }
-    return HttpData.serve(Env, {
+    return serve(HttpData.serve(Env, {
         prefix: 'blob/',
         mode,
         presignTtl: opts.presignTtl,
         cacheControl: Env.DEV_MODE ? 'no-cache' : 'max-age=31536000'
-    });
+    }));
 };
 
 /*  Serve login blocks. Always proxied: the access-control middleware in front of

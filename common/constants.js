@@ -25,6 +25,9 @@ Constants.paths = {
     decrees: 'decrees/',
     challenges: 'challenges/',
     logo: 'logo/',
+    // per-channel federation state and pending logs; absent unless a channel
+    // is federated, so a normal instance never creates this
+    federation: 'fed/',
     // local working copies of objects, used only by remote storage backends
     cache: 'cache/'
 };

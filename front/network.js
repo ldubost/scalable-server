@@ -148,9 +148,161 @@ const initExpress = (Env) => {
         }));
     };
 
+    /*  Public federation descriptor (federation spec R-23).
+
+        How a would-be peer learns this instance's federation public key and the
+        URL to dial. Deliberately JSON rather than the AMD modules the other
+        /api routes serve: the consumer is another server, not the client.
+
+        It publishes only what an operator must hand out to be peered with. The
+        peers we actually federate with are not listed — that is the operator's
+        business and R-34 makes replica-set membership visible to peers over the
+        authenticated session, not to the open web.
+    */
+    const serveFederation = (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        const coreId = Env.getCoreId('federation');
+        Env.interface.sendQuery(coreId, 'FEDERATION_INFO', {}, answer => {
+            if (answer?.error === 'ENOFEDERATION') {
+                return void res.status(404).send(JSON.stringify({
+                    federation: false
+                }, null, '\t'));
+            }
+            const data = answer?.data;
+            if (answer?.error || !data?.originId) {
+                return void res.status(503).send(JSON.stringify({
+                    federation: false,
+                    error: 'EUNAVAILABLE'
+                }, null, '\t'));
+            }
+            res.send(JSON.stringify({
+                federation: true,
+                version: 1,
+                originId: data.originId,
+                origin: Env.httpUnsafeOrigin
+            }, null, '\t'));
+        });
+    };
+
     app.get('/api/config', serveConfig);
     app.get('/api/broadcast', serveBroadcast);
     app.get('/api/instance', serveInstance);
+    app.get('/api/federation', serveFederation);
+
+    /*  The instances this one is peered with (R-46).
+
+        The client needs a peer's originId to scope a replication capability to
+        it. It must not fetch that from the peer itself — the browser has no
+        relationship with another instance, and its CSP rightly forbids the
+        request. So its own server answers. */
+    app.get('/api/federation/peers', (req, res) => {
+        Env.interface.sendQuery(Env.getCoreId('federation'), 'FEDERATION_PEERS', {},
+            answer => {
+                if (answer?.error === 'ENOFEDERATION') {
+                    return void res.status(404).json({ peers: [] });
+                }
+                if (answer?.error) {
+                    return void res.status(502).json({ error: String(answer.error) });
+                }
+                res.json(answer.data || { peers: [] });
+            });
+    });
+
+    /*  Is this channel federated, and with whom (R-50)?
+
+        The client asks this to federate a pad's auxiliary channels — chiefly
+        the pad chat, whose id lives in content no server can read and which is
+        usually created long after the pad was federated. Without it, opening a
+        chat on an already-federated pad would produce a channel that never
+        replicates, which reads as federation being broken.
+    */
+    app.get('/api/federation/channel/:channel', (req, res) => {
+        Env.interface.sendQuery(Env.getCoreId('federation'),
+            'FEDERATION_CHANNEL_STATUS', { channel: req.params.channel },
+            answer => {
+                if (answer?.error === 'ENOFEDERATION') {
+                    return void res.status(404).json({ federated: false });
+                }
+                if (answer?.error === 'INVALID_CHAN') {
+                    return void res.status(400).json({ error: 'INVALID_CHAN' });
+                }
+                if (answer?.error) {
+                    return void res.status(502).json({ error: String(answer.error) });
+                }
+                res.json(answer.data || { federated: false, members: [] });
+            });
+    });
+
+    /*  Ask this instance to mirror a pad from a peer (federation design §5.2,
+        step 3). The caller supplies a replication capability signed by the pad's
+        own key; that signature IS the authorisation (R-25), verified downstream
+        against the `validateKey` the servers already hold. Nothing here can be
+        used without one, and the operator's peering policy applies regardless.
+
+        Only the client can mint a capability, because only the client has the
+        pad's signing key — which is exactly the property that keeps the server
+        unable to federate a pad on its users' behalf.
+    */
+    /*  Shared shape for the two federation POSTs: hand the body to core, and
+        turn a refusal into a client error rather than a server one. A rejected
+        capability or an unpeered instance is the caller's problem, not a fault. */
+    const federationPost = (command, pick) => (req, res) => {
+        const body = req.body || {};
+        Env.interface.sendQuery(Env.getCoreId('federation'), command, pick(body),
+            answer => {
+                const error = answer?.error;
+                if (error === 'ENOFEDERATION') {
+                    return void res.status(404).json({ error: 'ENOFEDERATION' });
+                }
+                if (error) {
+                    const client = /^E_CAP_|^ENOTPEERED$|^INVALID_CHAN$|^EBADCHANNEL$|^ENOVALIDATEKEY$/
+                        .test(String(error));
+                    return void res.status(client ? 403 : 502).json({ error: String(error) });
+                }
+                // pass the answer through: callers need to distinguish
+                // "federated it" from "it already was"
+                res.json(Object.assign({ ok: true }, answer?.data || {}));
+            });
+    };
+
+    /*  Mark a pad this instance holds as federated, naming the instances allowed
+        to replicate it (design §5.2, step 2). Recording the replica set grants
+        nothing on its own: a peer still has to present a pad-key-signed
+        capability to subscribe.
+    */
+    app.post('/api/federation/enable', Express.json(),
+        federationPost('FEDERATION_ENABLE', (b) => ({
+            channel: b.channel, validateKey: b.validateKey, members: b.members,
+            // 'L2' asks for multi-master; anything else is anchored (L1)
+            level: b.level,
+            /*  Carried through to the peers as an INVITE. The capability is
+                minted by the client, which is the only party holding the pad
+                key; this server only relays it over the session it already has
+                with them. */
+            cap: b.cap
+        })));
+
+    app.post('/api/federation/replicate', Express.json(), (req, res) => {
+        const body = req.body || {};
+        const coreId = Env.getCoreId('federation');
+        Env.interface.sendQuery(coreId, 'FEDERATION_REPLICATE', {
+            channel: body.channel,
+            peer: body.peer,
+            cap: body.cap,
+            validateKey: body.validateKey
+        }, answer => {
+            const error = answer?.error;
+            if (error === 'ENOFEDERATION') {
+                return void res.status(404).json({ error: 'ENOFEDERATION' });
+            }
+            if (error) {
+                // a refused capability or an unpeered instance is a client error
+                const client = /^E_CAP_|^ENOTPEERED$|^INVALID_CHAN$|^EBADCHANNEL$/.test(String(error));
+                return void res.status(client ? 403 : 502).json({ error: String(error) });
+            }
+            res.json({ ok: true });
+        });
+    });
 
     const servePlugins = Env => {
         const plugins = Env.plugins;

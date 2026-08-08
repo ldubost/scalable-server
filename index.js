@@ -138,6 +138,13 @@ const coresReady = () => {
             startNode('storage', index, true, resolve);
         }));
     });
+    // federation is optional; instances that do not federate configure none
+    infraConfig?.federation?.forEach((data, index) => {
+        promises.push(new Promise(resolve => {
+            if (serverId && data.serverId !== serverId) { return resolve(); }
+            startNode('federation', index, true, resolve);
+        }));
+    });
     promises.push(new Promise(resolve => {
         if (serverId && infraConfig?.public?.httpServerId !== serverId) { return resolve(); }
         startNode('http', 0, true, resolve);
