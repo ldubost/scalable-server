@@ -2,12 +2,24 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+/*  Login blocks.
+
+    A block is a small (<= 256 byte) encrypted object holding the credentials a
+    registered user needs to log in. There is exactly one per account, it is
+    replaced wholesale on a password change, and the previous version is archived
+    rather than deleted so that a mistaken change can be undone.
+
+    There is no append here and nothing to cache: every operation is a single
+    read, write or move of a tiny object. So this goes straight through the
+    storage backend via the Basic store rather than through the cached
+    append-log machinery that channels need.
+*/
+
 const Block = module.exports;
 const Util = require("../common-util");
 const Core = require("../../common/core");
+const Basic = require("../../common/storage/basic.js");
 const Path = require("node:path");
-const Fs = require("node:fs");
-const Fse = require("fs-extra");
 const nThen = require("nthen");
 
 Block.mkPath = function (Env, publicKey) {
@@ -43,17 +55,20 @@ const addPlaceholder = function (Env, publicKey, reason, cb) {
     if (!reason) { return cb(); }
     const path = mkPlaceholderPath(Env, publicKey);
     const s_data = typeof(reason) === "string" ? reason : `${reason.code}:${reason.txt}`;
-    Fs.writeFile(path, s_data, cb);
+    // a placeholder may already exist from an earlier archival; replace it
+    Basic.delete(Env, path, () => {
+        Basic.write(Env, path, s_data, cb);
+    });
 };
 const clearPlaceholder = function (Env, publicKey, cb) {
     const path = mkPlaceholderPath(Env, publicKey);
-    Fs.unlink(path, cb);
+    Basic.delete(Env, path, cb);
 };
 Block.readPlaceholder = function (Env, publicKey, cb) {
     const path = mkPlaceholderPath(Env, publicKey);
-    Fs.readFile(path, function (err, content) {
+    Basic.read(Env, path, function (err, content) {
         if (err) { return void cb(); }
-        cb(content.toString('utf8'));
+        cb(content);
     });
 };
 
@@ -75,9 +90,7 @@ Block.archive = function (Env, publicKey, reason, _cb) {
     }
 
     // TODO Env.incrementBytesWritten
-    Fse.move(currentPath, archivePath, {
-        overwrite: true,
-    }, (err) => {
+    Basic.archive(Env, currentPath, archivePath, (err) => {
         cb(err);
         if (!err && reason) { addPlaceholder(Env, publicKey, reason, () => {}); }
     });
@@ -101,9 +114,7 @@ Block.restore = function (Env, publicKey, _cb) {
     }
 
     // TODO Env.incrementBytesWritten
-    Fse.move(archivePath, livePath, {
-        //overwrite: true,
-    }, (err) => {
+    Basic.restore(Env, archivePath, livePath, (err) => {
         cb(err);
         if (!err) { clearPlaceholder(Env, publicKey, () => {}); }
     });
@@ -113,24 +124,11 @@ const isValidKey = Block.isValidKey = function (publicKey) {
     return typeof(publicKey) === 'string' && publicKey.length === 44;
 };
 
-const exists = function (path, cb) {
-    Fs.stat(path, function (err, stat) {
-        if (err) {
-            if (err.code === 'ENOENT') {
-                return void cb(void 0, false);
-            }
-            return void cb(err);
-        }
-        if (!stat.isFile()) { return void cb('E_NOT_FILE'); }
-        return  void cb(void 0, true);
-    });
-};
-
 const checkPath = function (Env, publicKey, pathFunction, _cb) {
     const cb = Util.once(Util.mkAsync(_cb));
     if (!isValidKey(publicKey)) { return void cb("INVALID_ARGS"); }
     const path = pathFunction(Env, publicKey);
-    exists(path, cb);
+    Basic.exists(Env, path, cb);
 };
 
 Block.isAvailable = function (Env, publicKey, _cb) {
@@ -149,7 +147,16 @@ Block.check = function (Env, publicKey, _cb, noRedirect) { // 'check' because 'e
     }, cb)) { return; }
 
     const path = Block.mkPath(Env, publicKey);
-    Fs.access(path, Fs.constants.F_OK, cb);
+    // callers expect an error when the block is absent, not a boolean
+    Basic.exists(Env, path, (err, exists) => {
+        if (err) { return void cb(err); }
+        if (!exists) {
+            const e = new Error('ENOENT');
+            e.code = 'ENOENT';
+            return void cb(e);
+        }
+        cb();
+    });
 };
 
 Block.MAX_SIZE = 256;
@@ -158,15 +165,8 @@ Block.write = function (Env, publicKey, buffer, _cb) {
     const cb = Util.once(Util.mkAsync(_cb));
     const path = Block.mkPath(Env, publicKey);
     if (typeof(path) !== 'string') { return void cb('INVALID_PATH'); }
-    const parsed = Path.parse(path);
 
     nThen(function (w) {
-        Fse.mkdirp(parsed.dir, w(function (err) {
-            if (!err) { return; }
-            w.abort();
-            cb(err);
-        }));
-    }).nThen(function (w) {
         Block.archive(Env, publicKey, 'PASSWORD_CHANGE', w(function (/* err */) {
     /*
         we proceed even if there are errors.
@@ -176,8 +176,13 @@ Block.write = function (Env, publicKey, buffer, _cb) {
     */
         }));
     }).nThen(function () {
-        Fs.writeFile(path, buffer, { encoding: 'binary' }, cb);
+        /*  The archive above moved any previous block out of the way, so this is
+            normally a create. Delete first regardless: an archival that failed for
+            some reason other than "nothing to archive" must not leave the account
+            stuck with an un-replaceable block.  */
+        Basic.delete(Env, path, () => {
+            Basic.write(Env, path, buffer, cb);
+        });
         //Env.incrementBytesWritten(buffer && buffer.length);
     });
 };
-

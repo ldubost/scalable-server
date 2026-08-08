@@ -17,6 +17,8 @@ let { fork } = require('node:child_process');
 
 const DEFAULT_QUERY_TIMEOUT = 60000 * 15;
 const WORKER_TASK_LIMIT = 250000;
+// how long to wait for workers to exit during a graceful shutdown
+const WORKER_SHUTDOWN_TIMEOUT = 5000;
 
 
 /*
@@ -429,8 +431,58 @@ const init = workerConfig => {
             });
         },
         _workers: workers,
+        /*  Stop every worker and do not replace them.
+
+            The 'exit' and 'close' handlers above respawn a worker unless its state
+            has been cleared, which is how they tell a crash from a deliberate kill.
+            Shutting down therefore has to clear those references first, or the node
+            would spend its drain window spawning replacements for the workers it is
+            trying to stop.  */
+        shutdown: (_cb) => {
+            const cb = Util.once(typeof(_cb) === 'function' ? _cb : () => {});
+            const list = workers.splice(0, workers.length);
+            if (!list.length) { return void cb(); }
+
+            let pending = list.length;
+            const done = () => {
+                pending--;
+                if (pending <= 0) { cb(); }
+            };
+            // don't let an unresponsive worker hold up the whole shutdown
+            const timer = setTimeout(() => {
+                Log.error('WORKER_SHUTDOWN_TIMEOUT', { remaining: pending });
+                cb();
+            }, WORKER_SHUTDOWN_TIMEOUT);
+            const finish = Util.once(() => { clearTimeout(timer); });
+
+            list.forEach(state => {
+                const worker = state.worker;
+                // mark as deliberately killed before killing it
+                state.worker = undefined;
+                if (!worker) { return void done(); }
+
+                const onExit = Util.once(() => {
+                    done();
+                    if (pending <= 0) { finish(); }
+                });
+                worker.once('exit', onExit);
+                try {
+                    worker.kill();
+                } catch (err) {
+                    // already gone
+                    onExit();
+                }
+            });
+        },
         broadcast: (command, data, _cb) => {
             const cb = Util.once(_cb);
+            /*  Broadcasting to nobody is instantly complete.
+
+                Workers register asynchronously, so this list is empty for the
+                first moments of a node's life — which is exactly when decrees are
+                broadcast at startup. Without this, that callback was never
+                invoked and the node never finished starting.  */
+            if (!workers.length) { return void setTimeout(cb); }
             workers.forEach(state => {
                 const txid = guid();
                 response.expect(txid, cb, DEFAULT_QUERY_TIMEOUT);

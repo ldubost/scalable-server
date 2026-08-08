@@ -174,9 +174,12 @@ const destroyStream = function (stream) {
     } catch (err) {
         console.error(err);
     }
-    setTimeout(function () {
+    // a safety net for streams that did not close gracefully. It must not keep
+    // the process alive on its own, or a clean shutdown would wait it out.
+    const timer = setTimeout(function () {
         try { stream.destroy(); } catch (err) { console.error(err); }
     }, STREAM_DESTROY_TIMEOUT);
+    if (typeof(timer.unref) === 'function') { timer.unref(); }
 };
 
 /*  createIdleStreamCollector
@@ -197,11 +200,19 @@ by calling back with a TIMEOUT error or something
 const createIdleStreamCollector = function (stream) {
     // create a function to close the stream which takes no arguments
     // and will do nothing after being called the first time
-    var collector = Util.once(Util.mkAsync(Util.bake(destroyStream, [stream])));
+    var destroy = Util.once(Util.mkAsync(Util.bake(destroyStream, [stream])));
+
+    /*  Collecting explicitly also cancels the idle timeout. Without that, every
+        completed read leaves a pending timer for STREAM_CLOSE_TIMEOUT, which holds
+        the event loop open long after the work is done and delays a clean exit. */
+    var collector = function () {
+        if (collector.keepAlive) { collector.keepAlive.clear(); }
+        destroy();
+    };
 
     // create a second function which will execute the first function after a delay
     // calling this function will reset the delay and thus keep the stream 'alive'
-    collector.keepAlive = Util.throttle(collector, STREAM_CLOSE_TIMEOUT);
+    collector.keepAlive = Util.throttle(destroy, STREAM_CLOSE_TIMEOUT);
     collector.keepAlive();
     return collector;
 };
@@ -274,8 +285,12 @@ var getMetadataAtPath = function (Env, path, _cb) {
 var closeChannel = function (env, channelName, cb) {
     if (!env.channels[channelName]) { return void cb(); }
     try {
+        var channel = env.channels[channelName];
+        // cancel the pending auto-close: we are closing it now, and leaving the
+        // timer armed would hold the event loop open for CHANNEL_WRITE_WINDOW
+        if (channel.delayClose && channel.delayClose.clear) { channel.delayClose.clear(); }
         if (typeof(Util.find(env, [ 'channels', channelName, 'writeStream', 'close'])) === 'function') {
-            var stream = env.channels[channelName].writeStream;
+            var stream = channel.writeStream;
             destroyStream(stream, channelName);
         }
         delete env.channels[channelName];

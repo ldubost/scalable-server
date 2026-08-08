@@ -2,9 +2,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-var Fs = require("fs");
-var Fse = require("fs-extra");
 var Path = require("path");
+var Basic = require("../../common/storage/basic.js");
 var nacl = require("tweetnacl/nacl-fast");
 var nThen = require("nthen");
 var Util = require('../common-util');
@@ -55,45 +54,35 @@ var write = function (env, task, cb) {
     var dir = makeDirectoryId(task[0]);
     var path = Path.join(env.root, dir);
 
-    nThen(function (w) {
-        // create the parent directory if it does not exist
-        Fse.mkdirp(path, 0x1ff, w(function (err) {
-            if (err) {
-                w.abort();
-                return void cb(err);
-            }
-        }));
-    }).nThen(function () {
-        // write the file to the path
-        var fullPath = Path.join(path, id + '.ndjson');
+    // the file ids are based on the hash of the file contents to be written,
+    // so writing an exact task a second time is a no-op rather than a conflict
+    var fullPath = Path.join(path, id + '.ndjson');
 
-        // the file ids are based on the hash of the file contents to be written
-        // as such, writing an exact task a second time will overwrite the first with the same contents
-        // this shouldn't be a problem
-
-        Fs.writeFile(fullPath, str, function (e) {
-            if (e) {
-                env.log.error("TASK_WRITE_FAILURE", {
-                    error: e,
-                    path: fullPath,
-                });
-                return void cb(e);
-            }
-            env.log.info("SUCCESSFUL_WRITE", {
+    Basic.write(env.Env, fullPath, str, function (e) {
+        if (e && e.code !== 'EEXIST') {
+            env.log.error("TASK_WRITE_FAILURE", {
+                error: e,
                 path: fullPath,
             });
-            cb();
+            return void cb(e);
+        }
+        env.log.info("SUCCESSFUL_WRITE", {
+            path: fullPath,
         });
+        cb();
     });
 };
 
 var remove = function (env, path, cb) {
     // FIXME COLDSTORAGE?
-    Fs.unlink(path, cb);
+    Basic.delete(env.Env, path, cb);
 };
 
+/*  Object stores have no directories to remove; on the filesystem this tidies up
+    a day's folder once its tasks have all run. Failure is not interesting either
+    way, so callers only log it. */
 var removeDirectory = function (env, path, cb) {
-    Fs.rmdir(path, cb);
+    Basic.deleteDir(env.Env, path, cb);
 };
 
 var list = Tasks.list = function (env, cb, migration) {
@@ -101,7 +90,7 @@ var list = Tasks.list = function (env, cb, migration) {
 
     nThen(function (w) {
         // read the root directory
-        Fs.readdir(env.root, w(function (e, list) {
+        Basic.readDir(env.Env, env.root, w(function (e, list) {
             if (e) {
                 env.log.error("TASK_ROOT_DIR", {
                     root: env.root,
@@ -152,7 +141,7 @@ var list = Tasks.list = function (env, cb, migration) {
 
             queue.nThen(function (w) {
                 var subPath = Path.join(env.root, dir);
-                Fs.readdir(subPath, w(function (e, paths) {
+                Basic.readDir(env.Env, subPath, w(function (e, paths) {
                     if (e) {
                         env.log.error("TASKS_INVALID_SUBDIR", {
                             path: subPath,
@@ -187,7 +176,7 @@ var list = Tasks.list = function (env, cb, migration) {
 };
 
 var read = function (env, filePath, cb) {
-    Fs.readFile(filePath, 'utf8', function (e, str) {
+    Basic.read(env.Env, filePath, function (e, str) {
         if (e) { return void cb(e); }
 
         var task = tryParse(str);
@@ -367,16 +356,18 @@ var migrate = function (env, cb) {
 Tasks.create = function (config, cb) {
     if (!config.store) { throw new Error("E_STORE_REQUIRED"); }
     if (!config.log) { throw new Error("E_LOG_REQUIRED"); }
+    if (!config.Env) { throw new Error("E_ENV_REQUIRED"); }
 
     var env = {
         root: config.taskPath || './tasks',
         log: config.log,
         store: config.store,
+        // carries the storage backend; tasks are small, low-frequency records
+        // that go straight to storage rather than through any cache
+        Env: config.Env,
     };
 
-    // make sure the path exists...
-    Fse.mkdirp(env.root, 0x1ff, function (err) {
-        if (err) { return void cb(err); }
+    setTimeout(function () {
         cb(void 0, {
             write: function (time, command, args, cb) {
                 var task = encode(time, command, args);

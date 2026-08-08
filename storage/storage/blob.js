@@ -289,23 +289,32 @@ var upload = function (Env, safeKey, content, cb) {
 
         var stagePath = makeStagePath(Env, safeKey);
 
+        var report = function () {
+            if (!Env.sendCommand) { // WebSocket upload
+                session.currentUploadSize += len;
+                return void cb(void 0, dec.length);
+            }
+            Env.sendCommand('UPLOAD_REPORT_SESSION', { safeKey, len }, () => {
+                cb(void 0, dec.length);
+            });
+        };
+
+        /*  Acknowledge a chunk only once it has actually been written.
+
+            This used to call back without waiting — and, on the first chunk,
+            before the stream even existed, since makeFileStream is asynchronous.
+            Completing an upload reads the staged file, so an acknowledgement that
+            outran the write let completion see a file that was short or not yet
+            there at all.  */
         if (!session.blobstage) {
-            makeFileStream(stagePath, function (e, stream) {
+            return void makeFileStream(stagePath, function (e, stream) {
                 if (!stream) { return void cb(e); }
 
-                var blobstage = session.blobstage = stream;
-                blobstage.write(dec);
+                session.blobstage = stream;
+                stream.write(dec, function () { report(); });
             });
-        } else {
-            session.blobstage.write(dec);
         }
-        if (!Env.sendCommand) { // WebSocket upload
-            session.currentUploadSize += len;
-            return void cb(void 0, dec.length);
-        }
-        Env.sendCommand('UPLOAD_REPORT_SESSION', { safeKey, len }, () => {
-            cb(void 0, dec.length);
-        });
+        session.blobstage.write(dec, function () { report(); });
     };
 
     if (!Env.sendCommand && typeof(session.currentUploadSize) === 'number'
@@ -355,13 +364,27 @@ var checkUploadCookie = function (Env, safeKey, cb) {
     });
 };
 
-var closeBlobstage = function (Env, safeKey) {
+/*  Close the staging stream for an uploader.
+
+    A write stream flushes and closes asynchronously, so the staged file may still
+    be short of the bytes the uploader has sent. Completion reads that file — from
+    a different process — so anything that completes an upload must wait for the
+    'close' event rather than assuming this returned synchronously. Callers that
+    pass no callback keep the old fire-and-forget behaviour.  */
+var closeBlobstage = function (Env, safeKey, cb) {
+    var done = Util.once(Util.mkAsync(typeof(cb) === 'function' ? cb : function () {}));
     var session = Env.getSession(safeKey);
     if (!(session && session.blobstage && typeof(session.blobstage.close) === 'function')) {
-        return;
+        return void done();
     }
-    session.blobstage.close();
+    var stream = session.blobstage;
     delete session.blobstage;
+    stream.once('close', done);
+    stream.once('error', done);
+    stream.close();
+    // never hang an upload on a stream that refuses to emit
+    var timer = setTimeout(done, 10000);
+    if (typeof(timer.unref) === 'function') { timer.unref(); }
 };
 
 // upload_cancel
@@ -881,8 +904,8 @@ BlobStore.create = function (config, _cb) {
                 readPlaceholder(Env, blobId, cb);
             },
 
-            closeBlobstage: function (safeKey) {
-                closeBlobstage(Env, safeKey);
+            closeBlobstage: function (safeKey, cb) {
+                closeBlobstage(Env, safeKey, cb);
             },
             complete: function (safeKey, id, _cb) {
                 var cb = Util.once(Util.mkAsync(_cb));

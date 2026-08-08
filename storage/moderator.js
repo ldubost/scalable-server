@@ -28,23 +28,32 @@ Moderator.read = function (Env, id, cb) {
     });
 };
 
-Moderator.getAllKeys = function (Env) {
+/*  Formerly synchronous, using fs.readdirSync. Object stores have no synchronous
+    equivalent, so this is async now; a missing directory yields an empty list, as
+    the synchronous version's try/catch did.  */
+Moderator.getAllKeys = function (Env, cb) {
     let keys = [];
-    let dirPath = Path.join(Env.paths.base, "support");
-    try {
-        let prefixes = Basic.readDirSync(Env, dirPath);
-        prefixes.forEach((prefix) => {
-            let dirPath2 = Path.join(Env.paths.base, "support", prefix);
-            try {
-                let newKeys = Basic.readDirSync(Env, dirPath2);
-                keys.push(...newKeys);
-            } catch (e) {}
-        });
-        return keys;
-    } catch (e) {
-        // ENOENT, return empty array
-        return [];
-    }
+    nThen((waitFor) => {
+        let dirPath = Path.join(Env.paths.base, "support");
+        Basic.readDir(Env, dirPath, waitFor((err, prefixes) => {
+            if (err) {
+                // no support directory yet: there are no moderators
+                if (err.code === 'ENOENT') { return; }
+                waitFor.abort();
+                return void cb(err.code || err);
+            }
+            prefixes.forEach((prefix) => {
+                let dirPath2 = Path.join(Env.paths.base, "support", prefix);
+                Basic.readDir(Env, dirPath2, waitFor((err, newKeys) => {
+                    // an unreadable prefix shouldn't hide the moderators in the others
+                    if (err) { return; }
+                    keys.push(...newKeys);
+                }));
+            });
+        }));
+    }).nThen(() => {
+        cb(void 0, keys);
+    });
 };
 Moderator.getAll = function (Env, cb) {
     let users = {};

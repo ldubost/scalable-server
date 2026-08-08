@@ -1,10 +1,7 @@
 const Util = require("./common-util.js");
 const Path = require('node:path');
-const Fs = require("node:fs");
-const readFileBin = require("../storage/stream-file").readFileBin;
+const Basic = require("./storage/basic.js");
 const Schedule = require("../storage/schedule");
-const Fse = require("fs-extra");
-const nThen = require("nthen");
 
 const Decrees = {};
 
@@ -105,21 +102,16 @@ Decrees.create = (name, commands) => {
 
         Env.scheduleDecree.blocking('', (unblock) => {
             const done = Util.once(Util.both(cb, unblock));
-            nThen((w) => {
-                // ensure that the path to the decree log exists
-                Fse.mkdirp(Env.paths.decree, w(function (err) {
-                    if (!err) { return; }
-                    w.abort();
-                    done(err);
-                }));
-            }).nThen(function () {
-                const decreeName = Path.join(Env.paths.decree, name);
-                const stream = Fs.createReadStream(decreeName, {
-                    start: 0
-                });
+            /*  The decree log is small, read once at boot and written only by
+                storage:0, so it is read whole rather than streamed. An absent log
+                is the normal state of a fresh instance and is not an error.  */
+            const decreeName = Path.join(Env.paths.decree, name);
+            Basic.read(Env, decreeName, (err, content) => {
+                if (err) { return void done(err); }
+
                 const handler = createLineHandler(Env);
-                readFileBin(stream, (msgObj, next) => {
-                    let text = msgObj.buff.toString('utf8');
+                content.split('\n').forEach(text => {
+                    if (!text) { return; }
                     let line;
                     let changed = false;
                     try {
@@ -129,19 +121,21 @@ Decrees.create = (name, commands) => {
                         handler(err, text);
                     }
                     if (changed) { toSend.push(line); }
-                    next();
-                }, (err) => {
-                    done(err);
                 });
+                done();
             });
         });
     };
 
     const write = function (Env, decree, _cb) {
         var path = Path.join(Env.paths.decree, name);
+        // normally set up by load() at boot, but a write must not depend on
+        // having been preceded by one
+        Env.scheduleDecree ||= Schedule();
         Env.scheduleDecree.ordered('', function (next) {
             var cb = Util.both(Util.mkAsync(_cb), next);
-            Fs.appendFile(path, JSON.stringify(decree) + '\n', cb);
+            // written through: losing a decree loses instance configuration
+            Basic.append(Env, path, JSON.stringify(decree) + '\n', cb);
         });
     };
 

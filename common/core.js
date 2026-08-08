@@ -181,7 +181,10 @@ Core.getPaths = (mainConfig, isEnv) => {
         taskPath: config.taskPath || Path.join(paths.base, idx, paths.tasks),
         decreePath: config.decreePath || Path.join(paths.base, "0", paths.decrees),
         logoPath: config.logoPath || Path.join(paths.base, "0", paths.logo),
-        challengePath: config.challengePath || Path.join(paths.base, idx, paths.challenges)
+        challengePath: config.challengePath || Path.join(paths.base, idx, paths.challenges),
+        // only used when a remote storage backend is configured
+        cachePath: config.storage?.s3?.cache?.path ||
+            Path.join(paths.base, idx, paths.cache)
     };
     if (!isEnv) { return all; }
 
@@ -197,7 +200,8 @@ Core.getPaths = (mainConfig, isEnv) => {
         logo: all.logoPath,
         base: all.basePath,
         archive: all.archivePath,
-        task: all.taskPath
+        task: all.taskPath,
+        cache: all.cachePath
     };
 
 };

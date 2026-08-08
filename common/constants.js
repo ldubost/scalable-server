@@ -24,7 +24,9 @@ Constants.paths = {
     tasks: 'tasks/',
     decrees: 'decrees/',
     challenges: 'challenges/',
-    logo: 'logo/'
+    logo: 'logo/',
+    // local working copies of objects, used only by remote storage backends
+    cache: 'cache/'
 };
 Constants.adminDecree = 'decree.ndjson';
 

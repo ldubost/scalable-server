@@ -24,6 +24,61 @@ const Log = {
 };
 
 let serverId;
+
+/*  Children are tracked so that a shutdown can be forwarded to them and waited on.
+    Nodes buffer writes (an object-storage backend holds recently acknowledged
+    messages in a local cache until they are flushed), so killing the supervisor
+    without giving them a chance to drain loses data. */
+const children = [];
+let shuttingDown = false;
+
+// how long to wait for children to drain before giving up on them
+const SHUTDOWN_TIMEOUT = 40000;
+
+const stopChildren = (signal) => {
+    if (shuttingDown) {
+        // a second signal: the operator wants out now
+        Log.error('Forcing shutdown.');
+        children.forEach(child => { try { child.kill('SIGKILL'); } catch (e) {} });
+        return void process.exit(1);
+    }
+    shuttingDown = true;
+
+    const alive = children.filter(child => child.exitCode === null && !child.killed);
+    Log.info(`Stopping ${alive.length} node(s)...`);
+    if (!alive.length) { return void process.exit(0); }
+
+    let pending = alive.length;
+    let timer;
+    const finish = (code) => {
+        clearTimeout(timer);
+        process.exit(code);
+    };
+
+    alive.forEach(child => {
+        child.once('exit', () => {
+            pending--;
+            if (pending <= 0) { finish(0); }
+        });
+        try {
+            child.kill(signal);
+        } catch (err) {
+            pending--;
+            if (pending <= 0) { finish(0); }
+        }
+    });
+
+    timer = setTimeout(() => {
+        Log.error(`${pending} node(s) did not stop in time; killing.`);
+        children.forEach(child => { try { child.kill('SIGKILL'); } catch (e) {} });
+        finish(1);
+    }, SHUTDOWN_TIMEOUT);
+};
+
+['SIGTERM', 'SIGINT'].forEach(signal => {
+    process.on(signal, () => { stopChildren(signal); });
+});
+
 const startNode = (type, index, forking, cb) => {
     if (typeof (cb) !== 'function') { cb = () => { }; };
 
@@ -38,6 +93,7 @@ const startNode = (type, index, forking, cb) => {
     //Log.info(`Starting: ${initConfig.myId}`);
     if (forking) {
         let nodeProcess = fork(nodeFile);
+        children.push(nodeProcess);
         nodeProcess.send(initConfig);
         nodeProcess.on('message', (message) => {
             if (message.msg === 'READY') {
@@ -50,14 +106,18 @@ const startNode = (type, index, forking, cb) => {
         });
         // FIXME
         nodeProcess.on('error', (err) => {
+            if (shuttingDown) { return; }
             Log.error('Child process stopped due to error.');
             Log.error(err);
             process.exit(1);
         });
-        nodeProcess.on('exit', (err) => {
-            Log.error('Child process stopped due to error.');
-            Log.error(err);
-            process.exit(1);
+        nodeProcess.on('exit', (code, signal) => {
+            // during a shutdown, children exiting is the expected outcome;
+            // stopChildren() decides when everyone is done
+            if (shuttingDown) { return; }
+            Log.error(`Node ${type}:${index} exited unexpectedly ` +
+                      `(code ${code}, signal ${signal}). Stopping the server.`);
+            stopChildren('SIGTERM');
         });
     } else {
         require(nodeFile).start(initConfig);

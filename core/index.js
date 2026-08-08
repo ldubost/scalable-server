@@ -15,6 +15,7 @@ const nThen = require('nthen');
 const StorageCommands = require('./commands/storage');
 
 const Environment = require('../common/env.js');
+const Backends = require('../common/storage/backend/index.js');
 
 const {
     CHECKPOINT_PATTERN
@@ -667,8 +668,9 @@ const startServers = (mainConfig) => {
         }
     };
 
-    const { challengePath } = Core.getPaths(mainConfig);
-    Env.challengePath = challengePath;
+    const paths = Core.getPaths(mainConfig);
+    Env.challengePath = paths.challengePath;
+
     Env.workers = WorkerModule(workerConfig);
 
     let queriesToStorage = [];
@@ -715,6 +717,11 @@ const startServers = (mainConfig) => {
         COMMANDS[command] = frontToStorage(command, false, true);
     });
 
+    /*  Core nodes store short-lived authentication challenges, and challenges
+        gate file uploads. Nothing may be served before the backend that holds
+        them exists, or the first upload after a restart fails. */
+    const serve = () => {
+
     initIntervals();
 
     Env.interface = Interface.init(interfaceConfig, err => {
@@ -746,6 +753,28 @@ const startServers = (mainConfig) => {
         if (obj.type === 'front') {
             Env.interface.sendEvent(id, 'ADMIN_CMD', { cmd: 'SET_MODERATORS', data: { moderators: Env.moderators, freshKey: Env.freshKey } });
         }
+    });
+
+    };
+
+    /*  Core only reads and writes small challenge objects, so it skips the
+        capability probe: that probe uploads several MiB to test multipart copy,
+        which is pointless work for a node that never appends. */
+    const storageConfig = config.storage || {};
+    const storageType = storageConfig.type || 'fs';
+    const coreStorage = Object.assign({}, storageConfig, {
+        [storageType]: Object.assign({}, storageConfig[storageType], {
+            skipProbe: true
+        })
+    });
+
+    Backends.create(coreStorage, { root: paths.basePath }, (err, backend) => {
+        if (err) {
+            Env.Log.error('CORE_STORAGE_BACKEND_ERROR', err.message || err);
+            throw err;
+        }
+        Env.storageBackend = backend;
+        serve();
     });
 };
 

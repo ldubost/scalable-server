@@ -232,16 +232,29 @@ let communicationManager = function(ctx) {
             });
             promises.push(p);
         });
+        /*  A recipient that answers with nothing resolves as undefined, and a
+            recipient that could not be reached answers with a bare string. Reading
+            `.data` off either used to throw in here, which rejected the promise and
+            left the caller's callback pending forever — a node broadcasting decrees
+            at startup would simply never finish starting. Tolerate both shapes, and
+            never let a failure in here strand the caller.  */
+        const done = Util.once(cb);
         Promise.all(promises).then(values => {
-            const data = (values || []).map(obj => obj.data).filter(Boolean);
-            const error = (values || []).map(obj => {
+            const answers = (values || []).filter(obj => obj && typeof (obj) === 'object');
+            const data = answers.map(obj => obj.data).filter(Boolean);
+            const error = answers.map(obj => {
                 if (!obj.error) { return; }
                 return {
                     id: obj.id,
                     error: obj.error
                 };
             }).filter(Boolean);
-            cb(error, data);
+            done(error, data);
+        }, err => {
+            ctx.Log.error('INTERFACE_BROADCAST_ERROR', {
+                type, command, error: err && err.message
+            });
+            done([{ id: type, error: err && err.message }], []);
         });
     };
 

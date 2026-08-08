@@ -5,6 +5,8 @@ const Core = require("../common/core");
 const BlockStore = require("./storage/block");
 const Blob = require("./storage/blob.js");
 const { setHeaders } = require('../http-server/headers.js');
+const HttpData = require('./http-data.js');
+const Stores = require('./storage/index.js');
 const CpCrypto = require("../common/crypto.js")('sodiumnative');
 const Util = require('../common/common-util');
 const MFA = require("./storage/mfa");
@@ -38,8 +40,9 @@ COMMANDS.NEW_DECREES = (data, cb) => {
 };
 COMMANDS.CLOSE_BLOBSTAGE = (data, cb) => {
     const { safeKey } = data;
-    Env.blobStore.closeBlobstage(safeKey);
-    cb();
+    // answer only once the staged file is fully written: the process that
+    // completes the upload reads it as soon as this returns
+    Env.blobStore.closeBlobstage(safeKey, () => { cb(); });
 };
 COMMANDS.UPDATE_LOGO = (data, cb) => {
     Env.apiLogoCache = undefined;
@@ -65,8 +68,10 @@ const initServerHandlers = (Env, app) => {
             }
         }
         if (req.method === 'HEAD') {
-            Express.static(Path.resolve(Env.paths.blob), {
-                setHeaders: function (res /*, path, stat */) {
+            // answered from object metadata: no blob body is ever transferred
+            HttpData.blobs(Env, {
+                mode: 'proxy',
+                setHeaders: (res) => {
                     res.set('Access-Control-Allow-Origin', Env.enableEmbedding? '*': Env.permittedEmbedders);
                     res.set('Access-Control-Allow-Headers', 'Content-Length');
                     res.set('Access-Control-Expose-Headers', 'Content-Length');
@@ -98,21 +103,11 @@ const initServerHandlers = (Env, app) => {
         next();
     });
 
-    app.use("/blob", Express.static(Path.resolve(Env.paths.blob), {
-        maxAge: Env.DEV_MODE? "0d": "365d"
+    app.use("/blob", HttpData.blobs(Env, {
+        mode: Env.config?.storage?.[Env.config?.storage?.type]?.serve?.blobs,
+        presignTtl: Env.config?.storage?.[Env.config?.storage?.type]?.serve?.presignTtl
     }));
-    app.use("/datastore",
-        (req, res, next) => {
-            if (req.method === 'HEAD') {
-                next();
-            } else {
-                res.status(403).end();
-            }
-        },
-        Express.static(Env.paths.channel, {
-            maxAge: "0d"
-        }
-    ));
+    app.use("/datastore", HttpData.channels(Env));
 
     Env.plugins.addHttpEndpoints(Env, app, 'storage');
 
@@ -298,8 +293,8 @@ const initServerHandlers = (Env, app) => {
     // in a manner independent of the filesystem. ie. for detecting and archiving
     // inactive accounts in a way that will not be invalidated by other forms of access
     // like filesystem backups.
-    app.use("/block", Express.static(Path.resolve(Env.paths.block), {
-        maxAge: "0d",
+    app.use("/block", HttpData.blocks(Env, {
+        staticOptions: { maxAge: "0d" }
     }));
     // In case of a 404 for the block, check if a placeholder exists
     // and provide the result if that's the case
@@ -431,25 +426,32 @@ const init = (config, cb) => {
     Env.Log = Logger(config.config, Env.myId);
 
     const {
-        archivePath, blobPath, blobStagingPath
+        filePath, archivePath, blobPath, blobStagingPath, cachePath
     } = Core.getPaths(config);
 
     nThen(waitFor => {
-        // Load blobStore
-        Blob.create({
-            blobPath,
-            blobStagingPath,
-            archivePath,
+        /*  This process serves blobs, blocks and channel HEADs over HTTP and
+            handles uploads. It never appends to a channel, so it asks the factory
+            for the blob store alone rather than building channel caches and their
+            flush timers in every HTTP worker.  */
+        Stores.create({
+            paths: {
+                filePath, archivePath, blobPath, blobStagingPath, cachePath
+            },
+            config: config.config,
+            Log: Env.Log,
+            only: ['blob'],
             getSession: safeKey => {
                 return Core.getSession(Env.blobstage, safeKey);
             },
             sendCommand: Env.sendCommand
-        }, waitFor((err, store) => {
+        }, waitFor((err, stores) => {
             if (err) {
                 waitFor.abort();
                 return void cb(err);
             }
-            Env.blobStore = store;
+            Env.blobStore = stores.blobStore;
+            Env.storageBackend = stores.backend;
         }));
         setInterval(() => {
             Core.expireSessions(Env.blobstage);

@@ -20,8 +20,8 @@ Moderators.getAll = (Env, cb) => {
     });
 };
 // Setmoderatorenv storage to core:0
-Moderators.getKeysSync = (Env) => {
-    return Moderator.getAllKeys(Env);
+Moderators.getKeys = (Env, cb) => {
+    Moderator.getAllKeys(Env, cb);
 };
 
 Moderators.add = (Env, edPublic, data, adminKey, _cb) => {

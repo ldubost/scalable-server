@@ -16,6 +16,7 @@ const HKUtil = require("./hk-util.js");
 const MFAManager = require('./mfa-manager.js');
 
 const Environment = require('../common/env.js');
+const Shutdown = require('../common/shutdown.js');
 
 const Interface = require("../common/interface.js");
 const WSConnector = require("../common/ws-connector.js");
@@ -26,6 +27,7 @@ const WorkerModule = require("../common/worker-module.js");
 const Cluster = require("node:cluster");
 const File = require("./storage/file.js");
 const Blob = require("./storage/blob.js");
+const Stores = require("./storage/index.js");
 const BlockStore = require("./storage/block.js");
 const Sessions = require("./storage/sessions.js");
 const Basic = require("./storage/basic.js");
@@ -727,11 +729,101 @@ const initHttpServer = (Env, mainConfig, _cb) => {
         cb();
     });
     Env.cluster = {};
-    Env.cluster.closeBlobstage = safeKey => {
+    Env.cluster.closeBlobstage = (safeKey, cb) => {
         Env.clusters.broadcast('CLOSE_BLOBSTAGE', { safeKey }, () => {
             Env.Log.verbose('CLOSE_BLOBSTAGE');
+            if (typeof(cb) === 'function') { cb(); }
         });
     };
+};
+
+/*  Drain sequence for a storage node.
+
+    Registered in the order it must run: stop background work first so the backlog
+    stops growing, then flush anything buffered, then close handles and workers.
+
+    The flush step is a no-op for the filesystem store, which has nothing buffered.
+    It is the hook that an object-storage backend uses to push cached writes that
+    have already been acknowledged to clients.  */
+const initShutdown = (Env) => {
+    const shutdown = Env.shutdown = Shutdown.create({
+        Log: Env.Log,
+        label: Env.myId,
+        timeout: Env.config?.storage?.shutdownFlushTimeoutMs || 30000
+    });
+
+    shutdown.register('stop-background-work', done => {
+        Env.draining = true;
+        Object.keys(Env.intervals || {}).forEach(name => {
+            clearInterval(Env.intervals[name]);
+            delete Env.intervals[name];
+        });
+        done();
+    });
+
+    shutdown.register('flush-stores', done => {
+        const stores = [Env.store, Env.pinStore, Env.blobStore].filter(Boolean);
+        let pending = stores.length;
+        if (!pending) { return void done(); }
+
+        stores.forEach(store => {
+            // only stores that buffer writes implement this
+            if (typeof (store.flushAll) !== 'function') {
+                pending--;
+                if (!pending) { done(); }
+                return;
+            }
+            store.flushAll(err => {
+                if (err) {
+                    Env.Log.error('SHUTDOWN_FLUSH_ERROR', {
+                        error: err && err.message || err
+                    });
+                }
+                pending--;
+                if (!pending) { done(); }
+            });
+        });
+        if (!pending) { done(); }
+    });
+
+    shutdown.register('close-channels', done => {
+        if (typeof (Env.store?.closeInactiveChannels) !== 'function') {
+            return void done();
+        }
+        // an empty active set means "close everything"
+        Env.store.closeInactiveChannels(new Set());
+        done();
+    });
+
+    shutdown.register('shutdown-stores', done => {
+        [Env.store, Env.pinStore, Env.blobStore].forEach(store => {
+            if (typeof (store?.shutdown) === 'function') {
+                try { store.shutdown(); } catch (err) {
+                    Env.Log.error('SHUTDOWN_STORE_ERROR', {
+                        error: err && err.message || err
+                    });
+                }
+            }
+        });
+        done();
+    });
+
+    shutdown.register('stop-workers', done => {
+        const pools = [Env.workers, Env.clusters].filter(pool => {
+            return typeof (pool?.shutdown) === 'function';
+        });
+        if (!pools.length) { return void done(); }
+
+        let pending = pools.length;
+        pools.forEach(pool => {
+            pool.shutdown(() => {
+                pending--;
+                if (!pending) { done(); }
+            });
+        });
+    });
+
+    shutdown.install();
 };
 
 const onInitialized = (Env, _cb) => {
@@ -811,34 +903,54 @@ const start = (mainConfig) => {
     };
 
     const {
-        filePath, pinPath, archivePath, blobPath, blobStagingPath
+        filePath, pinPath, archivePath, blobPath, blobStagingPath, cachePath
     } = Core.getPaths(mainConfig);
     nThen(waitFor => {
-        File.create({
-            filePath, archivePath
-        }, waitFor((err, store) => {
-            if (err) { throw new Error(err); }
-            Env.store = store;
-        }));
-        File.create({
-            filePath: pinPath,
-            archivePath,
-            volumeId: 'pins',
-        }, waitFor((err, s) => {
-            if (err) { throw err; }
-            Env.pinStore = s;
-        }));
-        Blob.create({
-            blobPath,
-            blobStagingPath,
-            archivePath,
+        Stores.create({
+            paths: {
+                filePath, pinPath, archivePath, blobPath, blobStagingPath, cachePath
+            },
+            config,
+            Log: Env.Log,
+            monitoring: Env.plugins?.MONITORING,
             getSession: safeKey => {
                 return Core.getSession(Env.blobstage, safeKey);
+            },
+            // a channel with connected users must not be evicted from the cache
+            isPinned: rel => {
+                const id = rel.replace(/^..[\\/]/, '')
+                    .replace(/\.(metadata\.)?ndjson.*$/, '');
+                return Boolean(Env.channel_cache[id]);
             }
-        }, waitFor((err, store) => {
-            if (err) { throw new Error(err); }
-            Env.blobStore = store;
+        }, waitFor((err, stores) => {
+            if (err) {
+                waitFor.abort();
+                Env.Log.error('STORE_INIT_ERROR', err.message || err);
+                throw err;
+            }
+            Env.store = stores.store;
+            Env.pinStore = stores.pinStore;
+            Env.blobStore = stores.blobStore;
+            Env.storageBackend = stores.backend;
         }));
+    }).nThen(waitFor => {
+        /*  Reconcile the local cache against the store before serving anything.
+
+            A node that died with writes it had acknowledged but not yet flushed
+            still has them on disk; this is where they are pushed. Channels are
+            recovered individually, so booting is not serialised on the whole
+            cache.  */
+        [Env.store, Env.pinStore].forEach(store => {
+            if (typeof (store?.recover) !== 'function') { return; }
+            store.recover(waitFor((err, report) => {
+                if (err) {
+                    return void Env.Log.error('CACHE_RECOVERY_ERROR', err.message || err);
+                }
+                if (report && report.scanned) {
+                    Env.Log.info('CACHE_RECOVERED', report);
+                }
+            }));
+        });
     }).nThen(() => {
         let tasks_running;
         Env.intervals.taskExpiration = setInterval(() => {
@@ -906,10 +1018,16 @@ const start = (mainConfig) => {
         if (index !== 0) { return; }
         initAccountsIntervals();
 
-        Env.moderators = Moderators.getKeysSync(Env).map(safeKey => {
-            return Util.unescapeKeyCharacters(safeKey);
-        });
-        Env.interface.sendEvent('core:0', 'SET_MODERATORS', Env.moderators);
+        Moderators.getKeys(Env, waitFor((err, keys) => {
+            if (err) {
+                Env.Log.error('MODERATORS_LOADING_ERROR', err);
+                keys = [];
+            }
+            Env.moderators = keys.map(safeKey => {
+                return Util.unescapeKeyCharacters(safeKey);
+            });
+            Env.interface.sendEvent('core:0', 'SET_MODERATORS', Env.moderators);
+        }));
 
         Env.adminDecrees.load(Env, waitFor((err, toSend) => {
             if (err) {
@@ -962,6 +1080,9 @@ const start = (mainConfig) => {
             printLink();
         });
     }).nThen(() => {
+        // install signal handlers only once everything it has to drain exists
+        initShutdown(Env);
+
         if (process.send !== undefined) {
             process.send({ type: 'storage', index, msg: 'READY' });
         } else {

@@ -4,8 +4,7 @@ const Util = require("../common/common-util");
 const Constants = require("../common/constants");
 const Logger = require("../common/logger");
 const Core = require("../common/core");
-const File = require("./storage/file.js");
-const Blob = require("./storage/blob.js");
+const Stores = require("./storage/index.js");
 const Tasks = require("./storage/tasks.js");
 const Environment = require('../common/env');
 
@@ -35,49 +34,41 @@ const init = (config, cb) => {
 
     const {
         filePath, archivePath, pinPath, taskPath,
-        blobPath, blobStagingPath
+        blobPath, blobStagingPath, cachePath
     } = Core.getPaths(config);
     nThen(waitFor => {
-        File.create({
-            filePath, archivePath
-        }, waitFor((err, store) => {
-            if (err) {
-                waitFor.abort();
-                return void cb(err);
-            }
-            Env.store = store;
-        }));
-        Blob.create({
-            blobPath,
-            blobStagingPath,
-            archivePath,
+        /*  Workers build their own handles onto the same storage as the primary.
+            With a remote backend that means the same local cache directory too:
+            hydration is deliberately no-clobber, so several processes can pull the
+            same object concurrently without one overwriting appends the other has
+            not flushed yet.
+
+            Workers only ever read channel logs (indexes, metadata, hash offsets,
+            older history), so nothing here becomes dirty; flushing stays the
+            primary's job.  */
+        Stores.create({
+            paths: {
+                filePath, pinPath, archivePath, blobPath, blobStagingPath, cachePath
+            },
+            config: config.config,
+            Log: Env.Log,
             getSession: () => {}
-        }, waitFor((err, store) => {
+        }, waitFor((err, stores) => {
             if (err) {
                 waitFor.abort();
                 return void cb(err);
             }
-            Env.blobStore = store;
-        }));
-        File.create({
-            filePath: pinPath,
-            archivePath,
-            // important to initialize the pinstore with its own
-            // volume id otherwise archived pin logs will get mixed
-            // in with channels
-            volumeId: 'pins',
-        }, waitFor((err, store) => {
-            if (err) {
-                waitFor.abort();
-                return void cb(err);
-            }
-            Env.pinStore = store;
+            Env.store = stores.store;
+            Env.pinStore = stores.pinStore;
+            Env.blobStore = stores.blobStore;
+            Env.storageBackend = stores.backend;
         }));
     }).nThen(waitFor => {
         Tasks.create({
             log: Env.Log,
             taskPath,
             store: Env.store,
+            Env,
         }, waitFor((err, tasks) => {
             if (err) {
                 waitFor.abort();

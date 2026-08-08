@@ -91,11 +91,17 @@ Upload.cancel = (Env, data, cb) => {
 const completeUpload = (owned) => {
     return (Env, data, cb) => {
         const { id, safeKey }  = data;
-        Env.blobStore.closeBlobstage(safeKey);
-        Env.cluster.closeBlobstage(safeKey); // close blobstage in workers
-        const user = Core.getSession(Env.blobstage, safeKey);
-        const size = user.pendingUploadSize;
-        Env.worker.completeUpload(safeKey, id, Boolean(owned), size, cb);
+        /*  The upload is completed by a fork worker, which reads the staged file
+            written by an HTTP worker in yet another process. Wait for the stage to
+            be closed everywhere first: reading it while a write stream still has
+            buffered bytes yields a truncated file, silently. */
+        Env.blobStore.closeBlobstage(safeKey, () => {
+            Env.cluster.closeBlobstage(safeKey, () => { // close blobstage in workers
+                const user = Core.getSession(Env.blobstage, safeKey);
+                const size = user.pendingUploadSize;
+                Env.worker.completeUpload(safeKey, id, Boolean(owned), size, cb);
+            });
+        });
     };
 };
 

@@ -144,6 +144,55 @@ module.exports = {
      *   DATABASE VOLUMES
      * ===================== */
 
+    /*  Where the durable data lives.
+     *
+     *  'fs' (the default) keeps everything on the local filesystem, using the
+     *  paths configured further down. Any other value names a storage backend
+     *  provided by a plugin, and requires that plugin to be installed: a node
+     *  configured for a backend it cannot load refuses to start rather than
+     *  quietly writing to the local disk.
+     */
+    storage: {
+        type: 'fs',
+
+        /*  How long a node may spend flushing buffered data when it receives
+         *  SIGTERM or SIGINT, before it gives up and exits non-zero.
+         *
+         *  Only relevant for backends that buffer writes; the 'fs' backend has
+         *  nothing pending, so its drain is immediate.
+         */
+        //shutdownFlushTimeoutMs: 30000,
+
+        /*  S3-compatible object storage, used when type is 's3'. Requires the
+         *  S3 plugin in plugins/S3. Works with any S3-compatible provider -
+         *  set `endpoint` and `region` to match yours.
+         *
+        s3: {
+            endpoint: 'https://s3.fr-par.scw.cloud',
+            region: 'fr-par',
+            bucket: 'cryptpad',
+            // optional, lets several instances share one bucket
+            prefix: '',
+            // true for MinIO / Ceph and other gateways without virtual-host style
+            forcePathStyle: false,
+            credentials: {
+                accessKeyId: process.env.S3_ACCESS_KEY,
+                secretAccessKey: process.env.S3_SECRET_KEY
+            },
+
+            // documents are appended to a local cache and flushed to S3
+            // shortly afterwards; these bound how much recent editing a node
+            // can be holding when it dies. See docs/s3-storage.md.
+            cache: {
+                path: './data/0/cache',
+                flushDebounceMs: 5000,
+                flushMaxDelayMs: 30000,
+                flushMaxBytes: 1024 * 1024
+            }
+        }
+        */
+    },
+
     /*
     * By default, CryptPad fetches data in `basePath/idx/...` where idx
     * corresponds to the index of the storage node in charge of it.
