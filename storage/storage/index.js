@@ -113,7 +113,20 @@ Stores.create = (opts, _cb) => {
                 blobPath: paths.blobPath,
                 blobStagingPath: paths.blobStagingPath,
                 archivePath: paths.archivePath,
-                getSession: opts.getSession
+                getSession: opts.getSession,
+                /*  Required in the storage *cluster*, where an HTTP upload has
+                    no RPC session of its own and has to ask the primary for the
+                    caller's quota (`UPLOAD_GET_SESSION`). Without it
+                    `blob.js:upload` reaches `Env.sendCommand(...)` on an Env
+                    that has none and the worker dies with a TypeError — which
+                    surfaces as ECONNRESET at the proxy and an upload that stalls
+                    with no error anywhere useful.
+
+                    The object-storage branch below already forwards this; the
+                    filesystem branch did not, so HTTP uploads crashed the worker
+                    on `fs` while WebSocket uploads (which carry their own
+                    session) worked. */
+                sendCommand: opts.sendCommand
             }, w((err, store) => {
                 if (err) { w.abort(); return void cb(err); }
                 result.blobStore = store;
