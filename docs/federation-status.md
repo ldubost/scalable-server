@@ -189,7 +189,7 @@ Where a requirement was mostly built and the remainder was too small to schedule
 on its own, the remainder is split into a new requirement and the original marked
 done — so "partial" never becomes a place things go to be forgotten.
 
-Current: **38 done**, **2 partial**, 10 scheduled, 2 n/a, of 52.
+Current: **38 done**, **3 partial**, 10 scheduled, 2 n/a, of 53.
 
 The partials are **R-48** (the guard against reordering is built; the splice that
 repairs it is not — see above) and **R-28** (pad-key *and* instance-key authorisation on
@@ -356,6 +356,43 @@ It needed a new rig capability: stopping an instance and starting it again on
 the same ports and directory. That reaches a whole class of bug the suite could
 not previously see, namely anything the processes were holding in memory and
 never wrote down.
+
+## Pads that were split while both servers agreed (R-53)
+
+The most instructive failure so far. Two instances were serving visibly
+different documents while agreeing on every number federation tracks: identical
+`have` maps, identical committed tips, matching sequence counts. On the pad that
+was reported, 116 messages were common **and in identical order** — so the
+ordering machinery, the watermark, the merge and the anti-entropy were all
+working — plus 2 held only by one instance and 7 only by the other.
+
+Those extras never received a federation envelope. Core publishes a write only if
+the channel is in its in-memory federated set, and that set was empty in the
+window after a restart, so anything typed then was committed locally and dropped
+from federation. Because a sequence is allocated only at *publish* time, such a
+message has no sequence: no gap to find, nothing to resend, and every repair
+mechanism blind to it. Both servers were correct to believe they were in sync.
+
+**Prevention.** Storage now announces its federated channels to core as it
+starts. It holds the durable record and is up before the front accepts a client,
+so this closes the window at the earliest point available. The federation node's
+own restore still runs and is idempotent; two sources of truth for the same fact
+cannot conflict here, and the belt-and-braces is worth it for a failure this
+quiet.
+
+**Detection.** Agreement about federation state is not evidence of agreement
+about the document, so detection needs a number that does not come from the same
+bookkeeping: the length of the committed log, exchanged on the heartbeat. A
+mismatch is reported as `FEDERATION_DIVERGED`, rate-limited to once per channel
+per five minutes because a split pad stays split. Pointed at a live pair it found
+**8 split channels out of 30** immediately.
+
+**Repair is deliberately not attempted.** Re-sending an orphaned message gives it
+a fresh Lamport clock, so the peer appends it at its tail while this instance
+holds it mid-log — the same messages in different orders, which is the divergence
+rather than the cure. Converging properly means both sides rewriting their
+committed logs into the agreed order and telling clients to reload, which is R-6
+`RECONCILE` and rewrites live channel history. Scheduled, not improvised.
 
 ## Two bugs found by real use, and what they mean
 

@@ -28,6 +28,9 @@ const Envelope = require('../common/federation/envelope.js');
 const Ids = require('../common/federation/ids.js');
 
 // how many envelopes one SYNC_RES may carry
+// a split pad stays split, so say so occasionally rather than every heartbeat
+const DIVERGENCE_LOG_EVERY = 5 * 60 * 1000;
+
 const SYNC_BATCH = 256;
 
 /*  requestSync and the SYNC_RES handler call each other: a response that is not
@@ -488,14 +491,27 @@ const heartbeatState = (Env, session) => {
                     // the promise, not the last emitted clock — see merge.js
                     l: state.promise ?? (state.self?.lamport || 0)
                 };
+                /*  How many messages are actually in the committed log (R-53).
+
+                    Everything else in this frame is federation bookkeeping, and
+                    two instances can agree on all of it while holding different
+                    documents: a message committed while core did not know the
+                    channel was federated never gets a sequence at all, so no
+                    gap exists, `have` matches on both sides, and each is
+                    satisfied. The log length is the one number that does not
+                    come from the same bookkeeping, which is exactly why it can
+                    contradict it. */
                 /*  What we hold, per origin, so the peer can resend anything we
                     are missing (R-47). */
                 toStorage(Env, 'FED_HAVE', { channel }, (e2, h) => {
                     if (!e2 && h?.have) { entry.have = h.have; }
+                    toStorage(Env, 'FED_HEAD', { channel }, (e3, info) => {
+                    if (!e3 && typeof (info?.count) === 'number') { entry.n = info.count; }
                     out.push(entry);
                     if (--pending === 0 && out.length) {
                         session.send({ type: 'HEARTBEAT', channels: out });
                     }
+                    });
                 });
                 return;
             }
@@ -527,6 +543,40 @@ const onHeartbeat = (Env, session, frame) => {
 
             Cheap when there is nothing to do: the comparison is two integers
             per origin, and the common case sends nothing. */
+        /*  Divergence detection (R-53).
+
+            The two logs should hold the same messages, so they should be the
+            same length. When they are not, these instances are serving
+            different documents — and every other signal says they agree, which
+            is why this needs saying out loud rather than inferring.
+
+            Reported, not repaired. Re-sending an orphaned message would give it
+            a fresh clock, so the peer would append it at the end while we hold
+            it mid-log: the same messages in a different order, which is the
+            divergence rather than the cure. Repair needs the log rewrite of R-6.
+
+            Rate-limited per channel: this rides a 2 s heartbeat and a divergence
+            persists, so without it one split pad would fill the log. */
+        if (typeof (entry.n) === 'number') {
+            toStorage(Env, 'FED_HEAD', { channel: entry.c }, (eh, info) => {
+                if (eh || typeof (info?.count) !== 'number') { return; }
+                if (info.count === entry.n) {
+                    Env.divergedAt.delete(entry.c);
+                    return;
+                }
+                const last = Env.divergedAt.get(entry.c) || 0;
+                if (Date.now() - last < DIVERGENCE_LOG_EVERY) { return; }
+                Env.divergedAt.set(entry.c, Date.now());
+                Env.Log.error('FEDERATION_DIVERGED', {
+                    channel: entry.c,
+                    peer: Env.policy.describe(session.originId),
+                    mine: info.count,
+                    theirs: entry.n,
+                    note: 'logs differ in length; needs RECONCILE (R-6)'
+                });
+            });
+        }
+
         if (!entry.have) { return; }
         toStorage(Env, 'FED_RECONCILE', {
             channel: entry.c,

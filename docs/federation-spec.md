@@ -1036,6 +1036,44 @@ own server whether the pad is federated and to whom.
 
 ---
 
+## 11e. A message that was never federated
+
+The failure that survived every other safeguard, found on a live pair whose
+instances were serving visibly different documents while agreeing on everything
+federation tracks.
+
+Core decides whether to publish a write by looking the channel up in a memory
+set. If the channel is missing from it — the window after a restart, before
+anything has repopulated it — the message is committed to the local log and
+never federated. Because a federation sequence is only allocated at *publish*
+time, that message has **no sequence at all**. It leaves no gap; `have` matches
+on both sides; the watermark is satisfied; the committed tips are identical.
+Every repair mechanism in §4 and §5.3c works on sequences, so none of them can
+see it. It is lost permanently, and both instances are correct to believe they
+are in sync.
+
+Measured on one such pad: 116 messages common and in identical order, plus 2 held
+only by one instance and 7 only by the other.
+
+Two conclusions follow. The window must not exist — which means the durable
+record must reach core before any client can write, not merely eventually. And
+agreement about federation state is *not* evidence of agreement about the
+document: detecting this needs a number that does not come from the same
+bookkeeping. The length of the committed log is that number.
+
+> **R-53 (Divergence is detected, not assumed away).** An instance MUST announce
+> its federated channels from durable state before it can accept writes on them,
+> so that no window exists in which a write on a federated channel is committed
+> without being federated. Members MUST additionally exchange a measure of the
+> committed log itself — its length — and MUST report a mismatch: two instances
+> agreeing on every federation counter while holding different documents is a
+> reachable state, and one an operator cannot otherwise discover. Reporting is
+> required; repair is R-6, because re-sending an orphaned message would give it a
+> fresh clock and append it at the peer's tail while it sits mid-log here, which
+> is the divergence rather than the cure.
+
+---
+
 ## 12. Requirement index
 
 **Status** tracks what is implemented in this repository, against the milestones in
@@ -1107,6 +1145,7 @@ support, **M6** hardening (quotas, budgets, admin tooling), **M7** the NextGraph
 | R-47 | Missing messages are detected and repaired without operator action (§5.3c) | **done** — heartbeats carry per-origin `have`; a peer resends its own missing envelopes; envelopes are retained until every member has acknowledged them |
 | R-48 | A repair must splice late arrivals via `RECONCILE`, never reorder (§5.3c) | **partial → M6** — The *never reorder* half is done and enforced: the merge tracks the committed tip as a full `(l, o, id)` and refuses to commit anything sorting below it, logging `FEDERATION_RECONCILE_REQUIRED`. The channel stalls visibly instead of diverging silently, and every envelope stays in the pending log. The *splice* half needs R-6's `RECONCILE` and is not built |
 | R-49 | In-channel content federates automatically; out-of-channel data needs its own mechanism (§11c) | **done** — comments/annotations ride in the ChainPad content; blobs are the only exception and are covered by R-44. Corrected by R-50: the pad *chat* is neither — it is a separate channel |
+| R-53 | No window in which a federated write goes unfederated; log-length mismatch is detected and reported (§11e) | **partial → M6** — Storage announces its federated channels to core at startup, closing the window. Divergence is detected by exchanging the committed log length on the heartbeat and reported as `FEDERATION_DIVERGED`. Repair of an already-split pad needs R-6 and is not built |
 | R-52 | Replication is rebuilt from durable state at startup, and membership is per peer rather than per connection (§11d) | **done** — `FM.listFederated` enumerates the state files, `FED_LIST` gathers them across every storage node, and the federation node restores core's federated set and its replica-set membership before dialling out. Membership is also recorded on enable, subscribe and subscribe-ok, so a peer reconnecting is still a member; `federation-restart.test.js` |
 | R-51 | A blob reference resolves against the reader's own instance, not the uploader's (§11.6) | **done** — `media-tag.js` redirects an absolute `/blob/<xx>/<id>` src to the instance the reader is on, configured by `sframe-common.js` from `fileHost`/`origin`. Without it the request never arrives and R-44 never fires |
 | R-50 | A pad's auxiliary channels (the chat) federate with it; ephemeral ones do not (§11c) | **done** — the client enumerates `chat2` and mints a capability per channel from the pad key; `GET /api/federation/channel/:channel` reports membership so a chat opened after federation catches up; `federation-auxiliary.test.js` |

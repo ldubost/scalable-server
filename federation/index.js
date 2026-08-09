@@ -546,6 +546,8 @@ const start = (mainConfig) => {
         Log: Logger(config, myId),
         public: infra?.federation?.[index],
         pendingPings: new Map(),
+        // channel -> when we last said it had diverged (R-53)
+        divergedAt: new Map(),
         federationCommands: FEDERATION_COMMANDS
     };
     Environment.init(Env, mainConfig);

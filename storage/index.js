@@ -1308,6 +1308,41 @@ const start = (mainConfig) => {
         // List accepted commands
         Env.plugins.call('addStorageCommands')(Env, COMMANDS);
         Env.interface.handleCommands(COMMANDS);
+    }).nThen(() => {
+        /*  Tell core which channels are federated, as soon as we can (R-53).
+
+            Core decides whether to publish a write by looking the channel up in
+            a memory set. Until something fills that set, a write on a federated
+            channel is committed locally and **never federated at all** — and
+            because the federation sequence is only allocated at publish time,
+            such a message has no sequence, so no gap exists for anti-entropy to
+            find and no repair can ever recover it. Silent and permanent.
+
+            The federation node also restores this, but it starts independently
+            and has its own peers to dial; storage is the node that holds the
+            durable record and is up before the front accepts a client, so it is
+            the right one to close the window.
+
+            Announcing an already-known channel is idempotent, so the two
+            sources of truth cannot conflict. */
+        if (!Env.numberFederations || !Env.FM?.listFederated) { return; }
+        Env.FM.listFederated((err, states) => {
+            if (err) {
+                return void Env.Log.error('FEDERATION_ANNOUNCE_ERROR',
+                    String(err.message || err));
+            }
+            (states || []).forEach(st => {
+                if (!st.channel) { return; }
+                const isL2 = st.level === 'L2';
+                Env.interface.sendEvent(Env.getCoreId(st.channel), 'FED_CHANNELS', {
+                    channel: st.channel,
+                    federated: true,
+                    mirror: Boolean(!isL2 && st.origin && st.origin !== st.me),
+                    level: st.level
+                });
+            });
+            Env.Log.info('FEDERATION_ANNOUNCED', { channels: (states || []).length });
+        });
     }).nThen(waitFor => {
         // Only storage:0 can manage decrees, moderators and accounts
         if (index !== 0) { return; }
