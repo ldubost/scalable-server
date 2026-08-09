@@ -97,6 +97,10 @@ const onSubscribe = (Env, session, frame) => {
                 cost of being early is a duplicate, which R-18 makes a no-op;
                 the cost of being late is a lost message. */
             Env.subscriptions.add(session, channel);
+            /*  And durably, by originId: this session will not last forever and
+                the peer cannot re-subscribe without a capability only a browser
+                can mint (R-52). */
+            Env.subscriptions.restore(channel, [session.originId]);
             // we hold the pad: at L1 we are the anchor, at L2 just a member
             Env.markFederated(channel, { mirror: false, level: state.level });
 
@@ -148,6 +152,9 @@ const onSubscribeOk = (Env, session, frame) => {
         /*  At L1 we are a mirror and must forward writes to the anchor. At L2
             there is no anchor: we accept writes here and the merge orders them. */
         const isL2 = frame.level === 'L2';
+        Env.subscriptions.restore(channel,
+            (frame.members || [session.originId])
+                .filter(m => m && m !== Env.identity.originId));
         Env.markFederated(channel, { mirror: !isL2, level: frame.level });
         pending?.cb?.();
         requestSync(Env, session, channel);

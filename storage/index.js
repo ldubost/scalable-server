@@ -478,6 +478,25 @@ const fedEnableHandler = (data, cb) => {
     });
 };
 
+/*  Every channel with federation state here, for a restarting instance to
+    rebuild its routing from (R-52). Returns only what the caller needs to decide
+    where each channel belongs, not the whole state. */
+const fedListHandler = (data, cb) => {
+    if (!Env.FM?.listFederated) { return void cb('ENOFEDERATION'); }
+    Env.FM.listFederated((err, states) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, {
+            channels: (states || []).map(st => ({
+                channel: st.channel,
+                level: st.level,
+                origin: st.origin,
+                me: st.me,
+                members: st.members || []
+            }))
+        });
+    });
+};
+
 const fedStateHandler = (data, cb) => {
     Env.FM.state(data?.channel, (err, res) => {
         if (err) { return void cb(String(err.message || err)); }
@@ -671,6 +690,7 @@ let COMMANDS = {
     'FED_PING': fedPingHandler,
     'FED_ENABLE': fedEnableHandler,
     'FED_STATE': fedStateHandler,
+    'FED_LIST': fedListHandler,
     'FED_SINCE': fedSinceHandler,
     'FED_HEAD': fedHeadHandler,
     'FED_INGEST': fedIngestHandler,

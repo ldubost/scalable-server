@@ -870,7 +870,80 @@ same mechanism.
 > MUST be documented as such: a peer cannot enumerate blob ids, only redeem ones it
 > already knows.
 
+**The reference has to point at the reader's own instance.** The on-demand fetch
+is triggered by a miss, and a miss only happens if the request arrives. CryptPad
+stores a media-tag `src` as an *absolute* URL carrying the origin of whichever
+instance the file was uploaded to, and that string is part of the document, so it
+replicates verbatim. A federated pad opened on the other instance therefore asks
+the *first* one for the image: a cross-origin request its CSP forbids, which
+never reaches the instance the reader is on — so the blob is not merely
+unrendered, it is never replicated at all. The mechanism cannot fire because
+nothing asks it to.
+
+> **R-51 (Blob references are instance-neutral).** A blob reference inside
+> federated content MUST be resolved against the *reader's own* instance, not
+> against whichever instance the blob was uploaded to. A blob id names bytes, not
+> a server: it is content-addressed, so any instance may serve it, and a federated
+> one fetches it from a peer if it does not hold it (R-44). Clients MUST therefore
+> treat an origin embedded in a stored reference as advisory and redirect it,
+> rather than requiring content to be rewritten — documents predating federation
+> already contain absolute references.
+
 N1's exclusion of blobs no longer applies at L0–L2.
+
+---
+
+## 11d. Surviving a restart
+
+Which channels are federated, and with whom, is consulted on the write path —
+once per message — so it is held in memory: a `Set` in core, and the
+subscription maps in the federation node. Both are caches, and both are empty
+after a restart.
+
+Nothing else could put them back. A `SUBSCRIBE` carries a capability signed by
+the pad's own key, deliberately short-lived and single-use, so a restarted
+instance cannot ask its peers to remind it what it was replicating: only a
+browser holding the pad can mint one, and there may be nobody with the pad open
+for days. The per-channel state files are the only durable record, so they are
+what a restart must rebuild from.
+
+Left unrebuilt, the failure took the worst possible shape. Both instances came
+back, both served the pad, both accepted edits — and they simply stopped
+agreeing, with no error anywhere. An operator restarting a server had no reason
+to suspect it.
+
+The restart is only the visible case. The *peer that did not restart* is affected
+too: it had registered its counterpart against a session object, and when that
+session died it dropped the registration and then refused the reconnected peer's
+messages as coming from a channel it was not subscribed to. Since the peer cannot
+re-`SUBSCRIBE` without a capability, one instance restarting broke replication in
+**both** directions. The general statement is that replica-set membership is a
+property of the channel and must not be stored as a property of a connection —
+which also covers an ordinary network blip, not just a restart.
+
+**And live push is not enough.** A restart always leaves a gap: something is
+written in the seconds a server is down, and by definition no live push can
+deliver it. Only a sync on reconnect can. The first implementation re-synced the
+channels it *mirrored from an anchor* — an L1 notion, and empty at L2, where
+there is no anchor and every member is a peer. So a multi-master pad asked for
+nothing when its peer came back: live messages resumed and looked healthy, while
+everything written during the outage stayed on one side for good. Reconnection
+must therefore sync every channel shared with that peer, however the sharing
+arose.
+
+> **R-52 (Replication survives a restart).** An instance MUST rebuild its
+> replication routing from durable state at startup: for every channel with
+> federation state, that it is federated, at what level, whether this instance
+> anchors it, and which peers are members. Membership MUST be held per channel
+> and per peer identity, never per connection, so that a session dropping and
+> reconnecting neither loses it nor requires a fresh capability. It MUST NOT
+> depend on a peer re-subscribing, because a capability cannot be minted
+> without a client. On reconnection an instance MUST sync **every** channel it
+> shares with that peer, not only those it mirrors from an anchor: a restart
+> always leaves work that no live push can deliver. The
+> rebuild MUST read every storage node's share of the state, since it is sharded
+> by channel; a partial read MUST resume what it can and log the rest rather than
+> failing to start. It MUST NOT federate anything that was not already federated.
 
 ---
 
@@ -1028,10 +1101,12 @@ support, **M6** hardening (quotas, budgets, admin tooling), **M7** the NextGraph
 | R-41 | The R-38 precondition is a hard assertion at trim time — a premature `TRIM` destroys data (§11.3) | M3 — To be written *before* the trim path exists, so trimming is never reachable without the check |
 | R-42 | Metadata converges under *concurrent* modification, not merely anchor-authoritatively (split from R-12/R-20) | M6 — **Not done.** Two instances changing metadata at once resolve independently, so their owner lists can diverge permanently. §6 sanctions anchor-authority for now and concurrent owner changes are rare, so this is scheduled rather than blocking |
 | R-43 | The two-instance install is reproducible and verifiable by a script that fails loudly (§11b) | **done** — `experiments/federation/verify.sh`; 18 checks across both instances, covering stale processes, both origins, both sandbox origins, client components and the peer session |
-| R-44 | A replica fetches a referenced blob from a peer on first use and keeps it (§11.6) | **done** — `storage/federation/blobs.js` + `federation/blob-transfer.js`; chunked transfer, verified with a 200 KB blob and after the peer disappears |
+| R-44 | A replica fetches a referenced blob from a peer on first use and keeps it (§11.6) | **done** — `storage/federation/blobs.js` + `federation/blob-transfer.js`; chunked transfer, verified with a 200 KB blob and after the peer disappears, and end to end from a **real upload** decrypted on the far instance (`federation-upload.test.js`). The fetched copy is bytes only: no pin, no owner, no quota accounting — M6 |
 | R-45 | Blob access is the bearer-capability model; peers redeem ids, never enumerate them (§11.6) | **done** — documented in `blob-transfer.js` and enforced by R-27's allowlist |
 | R-46 | Federation is set up server-to-server; the client never contacts the peer (§5.3b) | **done** — `INVITE` over the existing session; `GET /api/federation/peers` lets the client pick a peer without contacting one |
 | R-47 | Missing messages are detected and repaired without operator action (§5.3c) | **done** — heartbeats carry per-origin `have`; a peer resends its own missing envelopes; envelopes are retained until every member has acknowledged them |
 | R-48 | A repair must splice late arrivals via `RECONCILE`, never reorder (§5.3c) | **partial → M6** — The *never reorder* half is done and enforced: the merge tracks the committed tip as a full `(l, o, id)` and refuses to commit anything sorting below it, logging `FEDERATION_RECONCILE_REQUIRED`. The channel stalls visibly instead of diverging silently, and every envelope stays in the pending log. The *splice* half needs R-6's `RECONCILE` and is not built |
 | R-49 | In-channel content federates automatically; out-of-channel data needs its own mechanism (§11c) | **done** — comments/annotations ride in the ChainPad content; blobs are the only exception and are covered by R-44. Corrected by R-50: the pad *chat* is neither — it is a separate channel |
+| R-52 | Replication is rebuilt from durable state at startup, and membership is per peer rather than per connection (§11d) | **done** — `FM.listFederated` enumerates the state files, `FED_LIST` gathers them across every storage node, and the federation node restores core's federated set and its replica-set membership before dialling out. Membership is also recorded on enable, subscribe and subscribe-ok, so a peer reconnecting is still a member; `federation-restart.test.js` |
+| R-51 | A blob reference resolves against the reader's own instance, not the uploader's (§11.6) | **done** — `media-tag.js` redirects an absolute `/blob/<xx>/<id>` src to the instance the reader is on, configured by `sframe-common.js` from `fileHost`/`origin`. Without it the request never arrives and R-44 never fires |
 | R-50 | A pad's auxiliary channels (the chat) federate with it; ephemeral ones do not (§11c) | **done** — the client enumerates `chat2` and mints a capability per channel from the pad key; `GET /api/federation/channel/:channel` reports membership so a chat opened after federation catches up; `federation-auxiliary.test.js` |

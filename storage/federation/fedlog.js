@@ -133,6 +133,51 @@ const create = (Env) => {
         });
     };
 
+    /*  Every channel this instance has federation state for.
+
+        Needed at startup. Which channels are federated, who anchors them and
+        who subscribes to what all live in memory in core and the federation
+        node — cheap to consult on the hot path, and gone the moment a process
+        restarts. The state files are the only durable record, so they are what
+        a restart has to rebuild from; without this, a restarted instance keeps
+        every replica's history on disk and quietly stops replicating to it.
+
+        Reads only `.state.json` keys, and pages through the listing rather than
+        assuming one call returns everything — on S3 it will not once an
+        instance federates more than a page of pads.
+    */
+    FM.listFederated = (cb) => {
+        const out = [];
+        const page = (cursor) => {
+            backend.list('fed/', { cursor }, (err, res) => {
+                if (err) { return void cb(err); }
+                const keys = (res && res.keys) || [];
+                let i = 0;
+                const next = () => {
+                    if (i >= keys.length) {
+                        if (res && res.cursor) { return void page(res.cursor); }
+                        return void cb(void 0, out);
+                    }
+                    const key = keys[i++].key;
+                    if (!/\.state\.json$/.test(key || '')) { return void setImmediate(next); }
+                    backend.get(key, (e, body) => {
+                        /*  A state file that has gone or will not parse is
+                            skipped rather than fatal: refusing to start over one
+                            unreadable pad would take out federation for all of
+                            them. */
+                        if (e) { return void setImmediate(next); }
+                        let state;
+                        try { state = Codec.decode(body); } catch (e2) { state = null; }
+                        if (state && state.channel) { out.push(state); }
+                        setImmediate(next);
+                    });
+                };
+                next();
+            });
+        };
+        page(void 0);
+    };
+
     FM.isFederated = (channel, cb) => {
         backend.exists(stateKey(channel), (err, exists) => {
             cb(err, Boolean(exists));

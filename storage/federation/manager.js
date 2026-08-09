@@ -81,6 +81,11 @@ const create = (Env) => {
     // Synchronous, for the message path. Undefined means "not yet known".
     FM.cachedState = (channel) => cache.get(channel)?.state;
     FM.isFederatedCached = (channel) => Boolean(cache.get(channel));
+
+    /*  Every channel this node holds federation state for, for a restarting
+        instance to rebuild its routing from (R-52). Straight through to the log:
+        the state files are the durable record, and nothing in memory here is. */
+    FM.listFederated = (cb) => log.listFederated(cb);
     FM.forget = (channel) => cache.delete(channel);
 
     /*  Enable replication for a channel (design §5.2). The capability has

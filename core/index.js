@@ -209,6 +209,62 @@ const onFedControlOut = (args, cb, extra) => {
     cb();
 };
 
+/*  Every federated channel on this instance, gathered from every storage node
+    (R-52).
+
+    Unlike every other federation command this one has no channel to route on,
+    and asking a single node would be wrong rather than merely incomplete:
+    federation state is sharded across the storage tier by channel id, so one
+    node holds one slice of it. A restart that rebuilt its routing from one
+    slice would resume replication for some pads and silently drop the rest.
+
+    A node that fails to answer is logged and skipped rather than failing the
+    whole call, for the same reason: partial recovery beats none. The channels
+    it holds resume when it is reachable again, since this is re-run on the
+    heartbeat.
+*/
+const onFederationList = (args, cb, extra) => {
+    if (!/^federation:/.test(extra?.from || '')) {
+        return void cb('UNAUTHORIZED_USER');
+    }
+    const channels = [];
+    let failed = 0;
+    let pending = Env.numberStorages;
+    if (!pending) { return void cb(void 0, { channels, incomplete: false }); }
+
+    for (let i = 0; i < Env.numberStorages; i++) {
+        Env.interface.sendQuery(`storage:${i}`, 'FED_LIST', {}, response => {
+            /*  `sendQuery` answers a *string* when the destination is not
+                connected yet, and an object otherwise. Checking `.error` alone
+                reads `'EINVALDEST'` as a successful empty answer — which is
+                exactly how this failed silently at startup, when storage has not
+                yet connected to core: federation restored nothing, said so
+                cheerfully, and replicated to no one. */
+            const bad = !response || typeof (response) !== 'object' || response.error;
+            if (bad) {
+                failed++;
+                /*  Info, not error: the overwhelmingly common cause is being
+                    asked before storage has connected, seconds into a cold
+                    start, which the caller handles by retrying. Logging it at
+                    error level made a healthy instance fail its own install
+                    check — the precise failure R-43 exists to prevent. A
+                    genuinely stuck storage node shows up as the retry escalating
+                    on the federation node, which is where the count lives. */
+                Env.Log.info('FEDERATION_LIST_UNAVAILABLE', {
+                    storage: i,
+                    error: String((response && response.error) || response)
+                });
+            } else {
+                (response.data?.channels || []).forEach(c => channels.push(c));
+            }
+            /*  `incomplete` matters more than the channels do: the caller must
+                be able to tell "nothing is federated" from "I could not find
+                out", because the first is a fact and the second is a retry. */
+            if (--pending === 0) { cb(void 0, { channels, incomplete: failed > 0 }); }
+        });
+    }
+};
+
 const federationToStorage = (command, storageCommand) => {
     return function (args, cb, extra) {
         if (!/^federation:/.test(extra?.from || '')) {
@@ -1007,6 +1063,7 @@ const startServers = (mainConfig) => {
         'FED_PING': onFedPing,
         'FED_ENABLE': federationToStorage('FED_ENABLE'),
         'FED_STATE': federationToStorage('FED_STATE'),
+        'FED_LIST': onFederationList,
         'FED_SINCE': federationToStorage('FED_SINCE'),
         'FED_HEAD': federationToStorage('FED_HEAD'),
         'FED_INGEST': federationToStorage('FED_INGEST'),

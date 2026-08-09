@@ -117,13 +117,24 @@ const FEDERATION_COMMANDS = {
       subscribers  channel -> sessions that asked US for it (we push to them)
       mine         channels WE asked a peer for (we pull, and refuse local writes)
 
-    Held in memory only. A session that drops loses its subscriptions and
-    re-subscribes on reconnect, which is also what re-runs the backfill — so
-    there is no persistent per-session state to get stale.
+      replicaSet   channels we replicate with named peers, rebuilt at startup
+                   from the durable state (R-52)
+
+    The first two are per-session and held in memory only: a session that drops
+    loses them and re-subscribes on reconnect, which is also what re-runs the
+    backfill.
+
+    `replicaSet` exists because that is not enough across a *restart*. A
+    SUBSCRIBE carries a capability signed by the pad key, which is short-lived
+    and single-use — so a restarted instance cannot simply re-subscribe, because
+    only a browser holding the pad can mint one and there may be nobody with the
+    pad open for days. Membership therefore has to come from the state files,
+    which are the only durable record of who replicates what.
 */
 const mkSubscriptions = () => {
     const subscribers = new Map();   // channel -> Set(session)
     const mine = new Map();          // channel -> originId we pull from
+    const replicaSet = new Map();    // channel -> Set(originId), durable
 
     return {
         add: (session, channel) => {
@@ -150,16 +161,36 @@ const mkSubscriptions = () => {
             mine.forEach((origin, c) => {
                 if (origin === session.originId && !out.includes(c)) { out.push(c); }
             });
+            /*  Restored membership counts too, or a channel that survived a
+                restart would carry no heartbeat — and without heartbeats the
+                watermark never advances and nothing commits. */
+            replicaSet.forEach((set, c) => {
+                if (set.has(session.originId) && !out.includes(c)) { out.push(c); }
+            });
             return out;
         },
         has: (session, channel) =>
-            Boolean(subscribers.get(channel)?.has(session)) || mine.has(channel),
+            Boolean(subscribers.get(channel)?.has(session)) || mine.has(channel) ||
+            Boolean(replicaSet.get(channel)?.has(session.originId)),
         follow: (channel, originId) => mine.set(channel, originId),
         following: () => Array.from(mine.entries()),
         // which instance anchors this channel, if we are a mirror of it
         originOf: (channel) => mine.get(channel),
         isMirror: (channel) => mine.has(channel),
-        count: () => subscribers.size + mine.size
+
+        /*  Durable membership, from the state files at startup. Additive and
+            idempotent: a live SUBSCRIBE that arrives later adds a session on top
+            and neither displaces the other. */
+        restore: (channel, originIds) => {
+            if (!replicaSet.has(channel)) { replicaSet.set(channel, new Set()); }
+            const set = replicaSet.get(channel);
+            (originIds || []).forEach(o => { if (o) { set.add(o); } });
+        },
+        membersOf: (channel) => Array.from(replicaSet.get(channel) || []),
+        forget: (channel) => replicaSet.delete(channel),
+        count: () => new Set([
+            ...subscribers.keys(), ...mine.keys(), ...replicaSet.keys()
+        ]).size
     };
 };
 
@@ -196,6 +227,13 @@ const enableLocal = (Env, args, cb) => {
         if (answer?.error) { return void cb(String(answer.error)); }
         const already = Boolean(answer?.data?.already);
         Env.markFederated(channel, { mirror: false, level });
+        /*  Record the replica set independently of any session (R-52). A peer's
+            session can drop and come back — a restart, a network blip — and it
+            cannot re-`SUBSCRIBE` without a fresh capability, which only a
+            browser can mint. Membership is a property of the channel, not of a
+            connection, so it is kept as one. */
+        Env.subscriptions.restore(channel,
+            (members || []).filter(m => m && m !== Env.identity.originId));
 
         /*  Invite the members over the session we already hold, rather than
             making the client call them. The capability came from the client and
@@ -236,6 +274,84 @@ const enableLocal = (Env, args, cb) => {
         }
         cb(void 0, { ok: true, already: already, invited: invited.length });
     });
+};
+
+/*  Put replication back the way it was, from the durable state (R-52).
+
+    Runs once at startup. For every channel with federation state, tell core it
+    is federated — so local writes are published again — and record the other
+    members, so they are pushed to and their frames accepted. A mirror also
+    re-follows its anchor, which is what makes `onSessionUp` re-run the backfill.
+
+    Failure is logged and not fatal. An instance that cannot reach storage yet
+    should still come up and serve unfederated pads; the alternative is refusing
+    to start, which helps nobody.
+*/
+const RESTORE_RETRY_MIN = 1000;
+const RESTORE_RETRY_MAX = 30 * 1000;
+
+const restoreFederation = (Env, done, delay) => {
+    done = Util.once(done || (() => {}));
+    const again = (why) => {
+        /*  Retry rather than give up. The commonest reason to get here is that
+            storage has not finished connecting to core yet — this runs seconds
+            into a cold start — and an instance whose replication depends on
+            winning that race is not fixed at all. Backs off to a slow poll so a
+            storage node that is down for a while costs nothing.
+
+            `done` fires regardless, so a peer session still comes up and serves
+            what it can while the routing is still being rebuilt. */
+        const next = Math.min((delay || RESTORE_RETRY_MIN) * 2, RESTORE_RETRY_MAX);
+        /*  Quiet while this is the expected startup race, loud once it has been
+            going long enough to mean something is actually wrong. */
+        const log = next >= RESTORE_RETRY_MAX ? Env.Log.error : Env.Log.info;
+        log('FEDERATION_RESTORE_RETRY', { in: next, why });
+        done();
+        Env.restoreTimer = setTimeout(() => {
+            restoreFederation(Env, done, next);
+        }, next);
+    };
+
+    Env.interface.sendQuery(Env.getCoreId('federation'), 'FED_LIST', {}, answer => {
+        /*  A string answer means the destination was not reachable; only an
+            object is a real reply. Reading `.error` alone treats the former as
+            success. */
+        if (!answer || typeof (answer) !== 'object' || answer.error) {
+            return void again(String((answer && answer.error) || answer));
+        }
+        /*  Some storage node could not be asked, so this list is a subset of
+            the truth. Applying it is right — those channels do replicate again —
+            but we must come back for the rest. */
+        if (answer.data?.incomplete) {
+            applyRestored(Env, answer.data.channels || []);
+            return void again('incomplete');
+        }
+        const channels = answer?.data?.channels || [];
+        const restored = applyRestored(Env, channels);
+        Env.Log.info('FEDERATION_RESTORED', { channels: restored });
+        done();
+    });
+};
+
+const applyRestored = (Env, channels) => {
+        let restored = 0;
+        channels.forEach(entry => {
+            const channel = entry?.channel;
+            if (typeof (channel) !== 'string' || !channel) { return; }
+
+            const me = entry.me || Env.identity.originId;
+            const others = (entry.members || []).filter(m => m && m !== me);
+            const isL2 = entry.level === 'L2';
+            const anchored = !isL2 && entry.origin && entry.origin !== me;
+
+            Env.subscriptions.restore(channel, others);
+            /*  At L1 we pull from the anchor and may not write locally; at L2
+                there is no anchor and membership alone is enough. */
+            if (anchored) { Env.subscriptions.follow(channel, entry.origin); }
+            Env.markFederated(channel, { mirror: Boolean(anchored), level: entry.level });
+            restored++;
+        });
+        return restored;
 };
 
 /*  Report whether a channel is federated here, and with whom (R-50).
@@ -412,6 +528,9 @@ const onNewDecrees = (Env, args, cb) => {
 
 const shutdown = (Env, args, cb) => {
     Object.values(Env.intervals || {}).forEach(clearInterval);
+    /*  The restore retries on a timer, so a shutdown between attempts would
+        otherwise fire it into a node that has already let go of its interface. */
+    if (Env.restoreTimer) { clearTimeout(Env.restoreTimer); Env.restoreTimer = null; }
     Env.peers?.shutdown();
     Env.server?.shutdown();
     cb?.();
@@ -487,11 +606,16 @@ const start = (mainConfig) => {
         writes never reach the instance we replicate from. */
     Env.subscribersOf = (channel) => {
         const sessions = Env.subscriptions.of(channel);
-        const originId = Env.subscriptions.originOf(channel);
-        if (originId) {
+        const add = (originId) => {
+            if (!originId) { return; }
             const session = Env.peers.sessions.get(originId);
             if (session && !sessions.includes(session)) { sessions.push(session); }
-        }
+        };
+        add(Env.subscriptions.originOf(channel));
+        /*  Members restored from durable state (R-52). Without this a restarted
+            instance keeps accepting local writes and pushes them to nobody,
+            which looks exactly like federation having been switched off. */
+        Env.subscriptions.membersOf(channel).forEach(add);
         return sessions;
     };
     Env.dropSubscription = (session, channel) => Env.subscriptions.drop(session, channel);
@@ -542,11 +666,18 @@ const start = (mainConfig) => {
     // prove a new session end to end immediately rather than at the next beat
     Env.onSessionUp = (session) => {
         beat(Env, session);
-        /*  Re-subscribe to everything we mirror from this peer. A reconnect must
-            resume replication without an operator doing anything, and the
-            backfill that follows is what closes whatever gap the outage left. */
-        Env.subscriptions.following().forEach(([channel, originId]) => {
-            if (originId !== session.originId) { return; }
+        /*  Backfill every channel we replicate with this peer. A reconnect must
+            resume replication without an operator doing anything, and the sync
+            that follows is what closes whatever gap the outage left.
+
+            `channelsFor` and not `following()`: the latter is the map of
+            channels we *mirror from an anchor*, which is an L1 notion and empty
+            at L2 — where there is no anchor and every member is a peer. So a
+            multi-master pad asked for nothing on reconnect: live messages
+            resumed, and everything written while the peer was away was never
+            pulled. Silent, and permanent once the R-48 guard starts holding
+            those late arrivals back. */
+        Env.subscriptions.channelsFor(session).forEach(channel => {
             Sync.requestSync(Env, session, channel);
         });
     };
@@ -596,8 +727,28 @@ const start = (mainConfig) => {
         }));
         Env.interface.handleCommands(CORE_COMMANDS);
     }).nThen(() => {
-        // dial out only once we can reach core, so a peer never arrives first
-        Env.peers.start();
+        /*  Rebuild replication from the state files before dialling out (R-52).
+
+            Which channels are federated, and with whom, is kept in memory here
+            and in core because both are consulted on the write path. A restart
+            empties both, and nothing else puts them back: a SUBSCRIBE needs a
+            capability only a browser can mint, so an instance cannot ask its
+            peers to remind it. Left as it was, a restarted instance kept every
+            replica's history on disk and quietly replicated to nobody — the pad
+            still opened on both sides and simply stopped agreeing.
+
+            Done before `peers.start()` so the routing is in place by the time a
+            peer session comes up and the first heartbeat goes out. */
+        /*  A short delay before the first attempt: core and storage are still
+            finding each other at this point, and asking too early costs a
+            round trip and an alarming-looking log line for no gain. Retrying
+            covers us if this is not long enough. */
+        Env.restoreTimer = setTimeout(() => {
+            restoreFederation(Env, () => {
+                // dial out only once we can reach core, so a peer never arrives first
+                Env.peers.start();
+            });
+        }, 2000);
 
         Env.intervals = {
             heartbeat: setInterval(() => {

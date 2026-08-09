@@ -516,6 +516,30 @@ const create = async (labels) => {
             await new Promise(r => setTimeout(r, 800));
         },
 
+        /*  Stop an instance and start it again on the same ports and the same
+            directory — an operator restarting a server, not a fresh install.
+
+            Nothing about the data changes, so anything that stops working
+            across this is state the processes were holding in memory and never
+            wrote down. That is a whole class of bug the suite could not reach
+            before, and one of them was live: replication stopped at every
+            restart because the routing lived only in memory.
+        */
+        restartInstance: async (inst) => {
+            await rig.killInstance(inst);
+            const config = Object.assign(mkConfig(inst.dir), { _label: inst.label });
+            const infra = mkInfra(inst.base);
+            const children = [];
+            children.push(await startNode('core', config, infra, sink));
+            children.push(await startNode('storage', config, infra, sink));
+            children.push(await startNode('federation', config, infra, sink));
+            children.push(await startNode('front', config, infra, sink));
+            inst.children.length = 0;
+            children.forEach(c => inst.children.push(c));
+            // let the nodes find each other before anything is asked of them
+            await new Promise(r => setTimeout(r, 2500));
+        },
+
         stop: async () => {
             for (const c of clients) {
                 try { await c.close(); } catch (e) { /* already gone */ }

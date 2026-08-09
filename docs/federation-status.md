@@ -130,8 +130,50 @@ gets it if we hold it. That is the bearer-capability model CryptPad already uses
 — the 48-character id is unguessable, and knowing it is what grants access —
 bounded by R-27, since only allowlisted instances have a session at all.
 
-Not done: quota accounting for federated blobs, and garbage collection of ones
-whose pad has since been un-federated. Both are M6.
+**Proved from a real upload, not just from bytes on disk.**
+`federation-blobs.test.js` places blobs directly in a store, which tests the
+transfer and skips everything an upload actually does — the RPC session, the
+quota check, the pending-upload slot, chunked encryption, `UPLOAD_COMPLETE`.
+That gap had already hidden the `sendCommand` bug above. So
+`federation-upload.test.js` drives the **client's own upload code**
+(`tests/common/upload.js`, what the browser runs) against instance A over both
+transports, then reads the blob from instance B and **decrypts it with the key
+that never left the client**. Byte-identical plaintext on B, including a 400 KB
+file whose 128 KB encryption chunks do not line up with the 64 KB transfer
+slices.
+
+Worth recording: `/blob` is served by the **storage** node, not the front, and
+the federated fallback lives in that middleware — a test reading through the
+front would exercise neither.
+
+**The reference has to point at the reader's own instance (R-51).** Found in a
+browser, and it invalidated the claim above that blobs "work": the pad on the
+second instance was requesting the image from the *first* one. CryptPad stores a
+media-tag `src` as an absolute URL carrying the origin of whichever instance the
+file was uploaded to, and that string is part of the document, so it replicates
+verbatim. The reader's browser then makes a cross-origin request the CSP forbids.
+
+The rendering failure is the lesser half. That request is what makes an instance
+notice it does not hold a blob, so sending it to the wrong server means **the
+blob is never replicated at all** — the on-demand fetch cannot fire because
+nothing asks it to. Every server-side test passed throughout, because they issue
+the request to the right instance by construction.
+
+Fixed in the client, at the one point every media-tag download passes through:
+an absolute `/blob/<xx>/<id>` src is redirected to the instance the reader is on.
+Done at render time rather than at upload time so documents that already contain
+an absolute reference are fixed too, with no content migration. The target is
+configured explicitly (`blobOrigin`, from `fileHost` or the instance origin) and
+never guessed — media-tags render inside the sandboxed frame, whose own origin is
+not where blobs live.
+
+**Not done, and the sharper statement of it:** a fetched blob is written as bytes
+only. It gets no `.metadata.ndjson`, no owner and **no pin**, so B's quota
+accounting cannot see it and CryptPad's blob eviction would treat it as
+unreferenced. In practice a GC'd copy is re-fetched on the next read, so the
+failure mode is churn rather than loss — but only while the peer still holds it.
+Once the pad is un-federated, or the peer goes away, B's copy is unowned with no
+way back. Pinning and quota accounting for federated blobs are **M6**.
 
 ### M6 — hardening
 
@@ -147,7 +189,7 @@ Where a requirement was mostly built and the remainder was too small to schedule
 on its own, the remainder is split into a new requirement and the original marked
 done — so "partial" never becomes a place things go to be forgotten.
 
-Current: **36 done**, **2 partial**, 10 scheduled, 2 n/a, of 50.
+Current: **38 done**, **2 partial**, 10 scheduled, 2 n/a, of 52.
 
 The partials are **R-48** (the guard against reordering is built; the splice that
 repairs it is not — see above) and **R-28** (pad-key *and* instance-key authorisation on
@@ -238,6 +280,82 @@ no server can read. Two consequences:
 Failing to federate the chat never fails the pad: a pad that federates without
 its chat is worth having. The failure is reported in the Federate dialog rather
 than swallowed.
+
+## Federation did not survive a restart (R-52) — fixed
+
+The most consequential bug found so far, and the one that best illustrates why
+"the tests pass" was never sufficient evidence.
+
+Everything the write path consults about federation is a memory cache: core's
+set of federated channels, and the federation node's map of who replicates what.
+Both are read per message, so caching them is right. Both are empty after a
+restart, and nothing put them back.
+
+Nothing *could*, either. A `SUBSCRIBE` carries a capability signed by the pad
+key — short-lived and single-use by design — so a restarted instance cannot ask
+its peers to remind it what it was replicating. Only a browser holding the pad
+can mint one, and there may be nobody with that pad open for days. The state
+files were the only durable record and nothing read them at startup.
+
+The failure took the worst available shape: both instances came back, both
+served the pad, both accepted edits, and they silently stopped agreeing. No
+error, no log line, nothing for an operator to notice.
+
+Fixed by rebuilding the routing from the state files before dialling out —
+across *every* storage node, since federation state is sharded by channel and a
+single node holds one slice of it. Restoring from one slice would have resumed
+some pads and quietly dropped the rest, which is the same bug wearing a
+disguise.
+
+**And the restart was only the visible half.** With the rebuild in place, the
+anchor restarting worked and both restarting together worked — but the *replica*
+restarting alone still failed, which is the case that proved the model wrong. The
+instance that did *not* restart had registered its counterpart against a session
+object; when that session died it dropped the registration, and then refused the
+reconnected peer's messages as coming from a channel it was not subscribed to.
+Since the peer cannot re-subscribe without a capability, one instance restarting
+broke replication in **both** directions.
+
+So membership is not per-connection. It is a property of the channel and a peer
+identity, recorded wherever it is learned — enable, subscribe, subscribe-ok and
+the startup rebuild — and never dropped when a session goes. That also covers an
+ordinary network blip, which had the same defect and would have looked like an
+unrelated intermittent fault.
+
+**Then it still did not work on the real rig**, twice over, and both misses are
+worth recording because the tests were green throughout.
+
+*First*, the rebuild ran before storage had connected to core — seconds into a
+cold start — and `interface.sendQuery` answers with a bare string `'EINVALDEST'`
+when a destination is not connected, but with an object otherwise. Checking
+`.error` read the string as a **successful empty answer**, so federation restored
+nothing and logged `{channels: 0}` cheerfully next to 26 state files on disk. The
+integration rig starts its nodes in order, so the race does not exist there. The
+restore now retries with backoff instead of depending on winning it, and reports
+`incomplete` so "nothing is federated" is distinguishable from "I could not find
+out". That string-vs-object trap is available to every caller of `sendQuery`.
+
+*Second*, and worse: a restart always leaves a gap — something is written in the
+seconds a server is down — and no live push can deliver it. Only the sync on
+reconnect can, and it was asking for the wrong set. It re-synced the channels in
+`following()`, the map of channels mirrored *from an anchor*: an L1 notion, empty
+at L2 where there is no anchor and every member is a peer. So a multi-master pad
+asked for nothing when its peer returned. Live messages resumed, everything
+looked healthy, and the outage's work stayed on one side permanently.
+
+All three original tests passed while that was live, because none of them wrote
+anything while the peer was away. That is the lesson worth keeping: the tests
+described the mechanism, not the situation.
+
+`federation-restart.test.js` now covers the anchor restarting, the replica
+restarting, both restarting together, **work done while a peer was away**, and —
+the guard against this fix going too far — that a restart never federates a
+channel that was not federated already. Verified on the live two-instance rig as
+well, with a real ChainPad document edited from both sides across a restart.
+It needed a new rig capability: stopping an instance and starting it again on
+the same ports and directory. That reaches a whole class of bug the suite could
+not previously see, namely anything the processes were holding in memory and
+never wrote down.
 
 ## Two bugs found by real use, and what they mean
 
@@ -330,8 +448,11 @@ instance does not federate.
 | Suite | Command | Covers |
 | --- | --- | --- |
 | unit | `npm run test:unit` | 301 tests (2 skipped: they need object storage). Handshake, capabilities, envelopes, the total order, the federation log, the merge rule |
-| integration | `npm run test:integration` | 30 tests across 8 files, each booting complete instances as real processes. Includes a **real ChainPad document** suite, a blob suite and an auxiliary-channel suite |
+| integration | `npm run test:integration` | 38 tests across 10 files, each booting complete instances as real processes. Includes a **real ChainPad document** suite, a blob suite and an auxiliary-channel suite |
 | experiments | `docs/experiments/chainpad-ordering/` | The ChainPad ordering findings that shaped §4 and §11 |
+
+`federation-upload.test.js` boots three complete rigs and needs longer than a
+900 s cap allows; run its tests individually or raise the timeout.
 
 **The integration suite is unreliable when every file runs in one invocation.**
 Each test boots 4–8 processes, and back-to-back suites contend on ports and

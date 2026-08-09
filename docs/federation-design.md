@@ -810,8 +810,17 @@ One implementation note worth keeping: the HTTP fallback also runs in the storag
 **cluster** process, which serves blobs and has a proxied interface but none of the
 federation state. Existence is therefore checked via `Env.blobStore`, not `Env.FB`.
 
-*Not done:* quota accounting for federated blobs, and garbage collection of blobs whose
-pad was later un-federated. Both M6.
+Proved end to end from a **real upload**, not from bytes placed on disk: a test drives
+the client's own upload implementation against one instance and decrypts the result on
+the other with the key that never left the client. That distinction matters — the earlier
+blob tests skipped the RPC session, the quota check and `UPLOAD_COMPLETE`, which is
+exactly where the `sendCommand` bug had been hiding.
+
+*Not done:* a fetched blob is written as bytes alone — no `.metadata.ndjson`, no owner,
+**no pin** — so the replica's quota accounting cannot see it and blob eviction treats it
+as unreferenced. A GC'd copy is re-fetched on the next read, so the failure mode is churn
+rather than loss, but only while the peer still holds it. Pinning, quota accounting and
+GC for un-federated pads are all M6.
 
 **M6 — Hardening.**
 Bloom-filter sync, rate limiting, budgets, admin UI/CLI (`FED_STATUS`), metrics
