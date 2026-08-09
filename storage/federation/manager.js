@@ -47,6 +47,8 @@ const create = (Env) => {
         gate passes, and control dispatches to the per-type appliers below. */
     let enableChecked, applyMeta, applyDelete, saveState;
     const log = FedLog.create(Env);
+    // channel -> when we last mentioned a late append (R-48); it repeats
+    const lateNotes = new Map();
     FM.log = log;
 
     /*  Which channels are federated, so the hot path costs a Map lookup rather
@@ -909,8 +911,21 @@ const create = (Env) => {
                 if (e) { return void finish(e); }
                 if (!pending.length) { return void finish(void 0, 0); }
 
-                const { ready, held, reordered } = Merge.partition(state, pending,
-                    Date.now());
+                const now = Date.now();
+                const { ready, held, reordered, stalled } = Merge.partition(
+                    state, pending, now);
+
+                /*  A hole in a member's sequence that never fills would block
+                    this pass for ever. Give up on it after GAP_TIMEOUT and step
+                    over it — see `noteStalled`. */
+                if (Merge.noteStalled(state, stalled, now)) {
+                    Env.Log.error('FEDERATION_GAP_ABANDONED', {
+                        channel,
+                        abandoned: (state.abandoned || []).slice(-3)
+                    });
+                    return void saveState(channel, state, etag,
+                        (e2) => finish(e2, 0));
+                }
 
                 /*  R-48: envelopes that arrived too late to be committed in
                     their proper place. They are held, not appended — appending
@@ -918,13 +933,17 @@ const create = (Env) => {
                     time, permanently and silently. Reported at error level
                     because the channel is now stalled for those origins and
                     only `RECONCILE` (R-6) can clear it. */
-                if (reordered && reordered.length) {
-                    Env.Log.error('FEDERATION_RECONCILE_REQUIRED', {
+                /*  Late arrivals were appended rather than held (R-48). Worth
+                    knowing about — it means these two logs order that stretch
+                    differently — but it is not an error and it repeats every
+                    pass, so it is reported quietly and at most once a minute. */
+                const lastNote = lateNotes.get(channel) || 0;
+                if (reordered && reordered.length && (now - lastNote) > 60000) {
+                    lateNotes.set(channel, now);
+                    Env.Log.info('FEDERATION_LATE_APPENDED', {
                         channel,
-                        held: reordered.length,
-                        tip: state.tip,
-                        earliest: reordered.reduce((a, b) =>
-                            (a && a.l <= b.l) ? a : b, null)
+                        appended: reordered.length,
+                        tip: state.tip?.l
                     });
                 }
                 if (!ready.length) { return void finish(void 0, 0); }

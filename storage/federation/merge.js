@@ -46,6 +46,47 @@ const Order = require('../../common/federation/order.js');
 // A member that has not been heard from in this long stops holding W back (R-5).
 const EVICT_AFTER = 60 * 1000;
 
+/*  How long a hole in one member's sequence holds that member's later messages
+    back before it is given up on.
+
+    Short, because it costs little: a hole delays only the origin that has it,
+    and the messages behind it are not lost — they are stored either way, and it
+    is their position in the order that is at stake, which the client resolves.
+    A minute is long enough for an ordinary backfill and short enough that a pad
+    with a permanent hole in its history keeps working. */
+const GAP_TIMEOUT = 60 * 1000;
+
+/*  Note that a member is holding the pass up, and give up on it once it has
+    done so for too long. Returns true if anything was abandoned, so the caller
+    knows the state needs saving. */
+const noteStalled = (state, stalled, now) => {
+    const since = state.stalledSince = state.stalledSince || {};
+    const seen = new Set();
+    let changed = false;
+
+    (stalled || []).forEach(({ origin, expected }) => {
+        seen.add(origin);
+        const at = since[origin];
+        if (!at || at.expected !== expected) {
+            since[origin] = { at: now, expected };
+            return;
+        }
+        if ((now - at.at) < GAP_TIMEOUT) { return; }
+        state.abandoned = state.abandoned || [];
+        if (!state.abandoned.some(x => x.o === origin && x.s === expected)) {
+            state.abandoned.push({ o: origin, s: expected, t: now });
+        }
+        /*  Step over the hole so the run can continue past it. */
+        const peer = state.peers?.[origin];
+        if (peer) { peer.committedSeq = Math.max(peer.committedSeq ?? -1, expected); }
+        delete since[origin];
+        changed = true;
+    });
+
+    Object.keys(since).forEach(o => { if (!seen.has(o)) { delete since[o]; } });
+    return changed;
+};
+
 /*  The next Lamport clock for a message accepted here.
 
     Standard Lamport rule: one more than the highest clock this replica has seen
@@ -188,34 +229,72 @@ const partition = (state, pending, now) => {
         guess. It costs latency and self-heals the moment the gap fills; the
         alternative risks a divergence that never heals.
     */
-    const incomplete = (state.members || []).some(m => {
-        if (m === state.me || evicted.has(m)) { return false; }
+    /*  Who is holding the pass up, and since when.
+
+        Waiting is right while the messages are still coming. Waiting *forever*
+        is not: a sequence can contain a hole that no longer exists to be filled
+        — messages lost in an outage before anything retained them for resend —
+        and then the channel never commits again. Federation looks healthy the
+        whole time, because it is: sessions up, heartbeats flowing, and every
+        pass declining to commit for a reason that will never stop being true.
+
+        So a hole that has not filled within `GAP_TIMEOUT` is given up on. That
+        loses nothing: the messages either do not exist, or arrive later through
+        the repair (R-6), which puts them in the log regardless of what the
+        federation order thinks. It costs the guarantee that the two logs are in
+        the same order across that hole, which is the client's to reconcile
+        (R-54). A stalled channel helps nobody. */
+    const stalled = [];
+    (state.members || []).forEach(m => {
+        if (m === state.me || evicted.has(m)) { return; }
         const reported = state.peers?.[m]?.seq;
-        if (typeof (reported) !== 'number') { return false; }
-        return reported > (haveThrough.get(m) ?? -1);
+        if (typeof (reported) !== 'number') { return; }
+        if (reported > (haveThrough.get(m) ?? -1)) {
+            stalled.push({ origin: m, expected: (haveThrough.get(m) ?? -1) + 1 });
+        }
     });
 
-    /*  R-48: an envelope that sorts *before* what is already committed.
+    /*  A hole holds back the origin that has it, and nothing else.
+
+        It used to stop the whole pass: if any member had announced a message we
+        had not received, nothing at all committed, including our own writes and
+        other members'. The reasoning was that a message still in flight could
+        otherwise arrive after we had committed past it, and have to be inserted
+        behind something already in the log.
+
+        That is true, and it is not worth freezing a channel for. The messages
+        either arrive — and the client reconciles their placement, which is its
+        job (R-54) — or they never existed, in which case waiting for them stops
+        the pad for good. One peer's gap must not be able to silence everyone.
+
+        So the wait is scoped to the origin that is missing something, and even
+        there it is bounded: `noteStalled` gives up after GAP_TIMEOUT. */
+    stalled.forEach(({ origin, expected }) => {
+        const at = blockedAbove.get(origin);
+        if (!(at <= expected)) { blockedAbove.set(origin, expected); }
+    });
+    const incomplete = false;
+
+    /*  An envelope that sorts *before* what is already committed (R-48).
 
         The commit rule is meant to make this impossible — nothing commits until
-        no member can still produce something earlier. It happens anyway when
-        the rule was applied with incomplete information: a peer evicted after
-        60s of silence stops holding the watermark back, and its backlog arrives
-        afterwards carrying clocks below the committed head.
+        no member can still produce something earlier — and it happens anyway
+        when the rule was applied with incomplete information: an evicted peer's
+        backlog, or a gap that was given up on.
 
-        Appending it is the one thing we must not do. Our peer, which had it in
-        time, committed it in its proper place; appending it here gives the two
-        instances the same set of messages in different orders, which §11.1
-        showed ChainPad does not recover from — a permanent, silent divergence
-        with both sides believing they are in sync.
+        An earlier version **held these indefinitely**, on the grounds that
+        appending one gives the two instances the same messages in different
+        orders, which §11.1 showed ChainPad does not resolve by itself. The
+        reasoning was sound and the conclusion was not. Holding is not a neutral
+        act: the message stays out of the peer's log entirely, so instead of two
+        orders of the same content we get two different *contents*, permanently,
+        which is strictly worse. On a live pad this produced 394 refusals in two
+        minutes and a channel that never caught up.
 
-        Repairing it properly means splicing it into the committed log and
-        telling clients to reload, which is R-6's `RECONCILE` and is not built.
-        Until it is, such an envelope is **held indefinitely and reported**. The
-        channel stalls, visibly, in a state an operator can see and a future
-        `RECONCILE` can resolve from the pending log — which still holds every
-        envelope involved. A visible stall is recoverable; a silent divergence
-        is not.
+        So it is appended, and reported. Both instances end up holding
+        everything, which is the property worth protecting (R-54); their
+        placement is left to the client, which can read the content and already
+        resolves a chain it receives out of order.
     */
     const tip = state.tip;
     const sortsBeforeTip = (e) => {
@@ -227,18 +306,14 @@ const partition = (state, pending, now) => {
     const held = [];
     const reordered = [];
     fresh.forEach(e => {
-        if (sortsBeforeTip(e)) {
-            reordered.push(e);
-            held.push(e);
-            return;
-        }
+        if (sortsBeforeTip(e)) { reordered.push(e); }
         const gapAt = blockedAbove.get(e.o);
         if (!incomplete && e.l <= W && e.s < gapAt) { ready.push(e); }
         else { held.push(e); }
     });
 
     return {
-        watermark: W, incomplete, held, reordered,
+        watermark: W, incomplete, held, reordered, stalled,
         ready: Order.sortTail(ready)
     };
 };
@@ -265,8 +340,22 @@ const observe = (state, originId, info, now) => {
     if (typeof (info.lamport) === 'number' && info.lamport > peer.lamport) {
         peer.lamport = info.lamport;
     }
-    if (typeof (info.seq) === 'number' && info.seq > peer.seq) {
-        peer.seq = info.seq;
+    /*  A heartbeat is the peer describing its own log, so it is authoritative
+        and may move this *down*; an envelope only ever raises it.
+
+        The distinction matters because the value is a promise we then wait on:
+        the merge refuses to commit anything while a member has announced
+        messages we have not received. Kept monotonic, a single wrong high value
+        — from a restore, a rollback, or a bug — freezes the channel for good,
+        because the peer can never take it back. That is not hypothetical: a pad
+        sat with 37 uncommitted envelopes waiting for sequences 72 to 126 from a
+        peer whose log ended at 71.
+
+        An envelope stays monotonic because it is evidence of one message, not a
+        statement about the sender's log, and arrives out of order routinely. */
+    if (typeof (info.seq) === 'number') {
+        if (info.authoritative) { peer.seq = info.seq; }
+        else if (info.seq > peer.seq) { peer.seq = info.seq; }
     }
     peer.atime = typeof (now) === 'number' ? now : Date.now();
 
@@ -385,5 +474,5 @@ const missingFor = (state, peerHave, pending) => {
 
 module.exports = {
     nextLamport, promise, watermark, partition, observe, noteCommitted, have, missingFor,
-    evictedMembers, mayTrim, EVICT_AFTER
+    evictedMembers, mayTrim, noteStalled, EVICT_AFTER, GAP_TIMEOUT
 };

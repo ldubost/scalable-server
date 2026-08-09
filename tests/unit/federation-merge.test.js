@@ -103,20 +103,24 @@ test('commit: only up to the watermark, in (l, o, id) order', () => {
     assert.deepStrictEqual(held.map(e => e.id), ['a5']);
 });
 
-/*  R-17, in its corrected form.
+/*  R-17, and the limit of what it should cost.
  *
- *  The first version of this blocked only the origin with the gap and let other
- *  origins commit past it. That is wrong: a member's Lamport *promise* says only
- *  that it will not emit anything lower in future — it says nothing about
- *  whether we have received what it already sent. A message still in flight
- *  could then arrive and need inserting *behind* something already committed,
- *  which is exactly the reordering docs/experiments/chainpad-ordering showed
- *  produces permanent, non-self-healing divergence.
+ *  A gap in a member's sequence means a message we have not received, whose
+ *  clock may sort before ones we hold. Committing past it risks having to insert
+ *  that message *behind* something already in the log — the reordering
+ *  docs/experiments/chainpad-ordering showed produces divergence.
  *
- *  So while any live member is incomplete, nothing commits. It costs latency
- *  and heals the instant the gap fills.
+ *  An earlier version therefore stopped the *whole pass*: while any member was
+ *  incomplete, nothing committed at all. That is too much. It means one peer's
+ *  hole silences every other member and this instance's own writes, and if the
+ *  hole is permanent — messages lost in an outage before anything retained them
+ *  — the channel never commits again. Measured on a live pad: 40 envelopes
+ *  waiting on sequences that no longer existed, while federation looked healthy.
+ *
+ *  So a gap holds back the origin that has it, and nobody else. Placement of a
+ *  late arrival is the client's to reconcile (R-54); a stalled pad helps no one.
  */
-test('commit: an incomplete member blocks the whole pass, not just itself', () => {
+test('commit: a gap holds back its own origin, not the whole pass', () => {
     const state = mkState({
         members: [A, B, C],
         self: { seq: 0, lamport: 9, committedSeq: -1 },
@@ -131,10 +135,16 @@ test('commit: an incomplete member blocks the whole pass, not just itself', () =
         env(B, 2, 2, 'b2'),   // b1 is missing
         env(C, 0, 1, 'c0')
     ];
-    const { ready, held, incomplete } = Merge.partition(state, pending, NOW);
-    assert.strictEqual(incomplete, true, 'B is missing messages it has announced');
-    assert.deepStrictEqual(ready, [], 'nothing may commit while a member is incomplete');
-    assert.strictEqual(held.length, 3);
+    const { ready, held } = Merge.partition(state, pending, NOW);
+    const ids = ready.map(e => e.id);
+
+    assert.ok(ids.includes('c0'),
+        'another member must not be silenced by B\'s gap');
+    assert.ok(ids.includes('b0'),
+        'and B\'s messages *below* its gap are fine');
+    assert.ok(!ids.includes('b2'),
+        'but nothing of B\'s past the gap, which is what the gap rule is for');
+    assert.ok(held.some(h => h.id === 'b2'));
 });
 
 /*  Once the gap fills, the same state commits everything in order. */
@@ -289,10 +299,12 @@ test('trim: a non-numeric point is refused rather than coerced', () => {
  *  here would give the two instances the same messages in different orders —
  *  the §11.1 failure, which is permanent and silent.
  *
- *  So it is held. The channel stalls where an operator can see it, and the
- *  envelope stays in the pending log for a future RECONCILE to splice.
+ *  Holding it was the first answer and the wrong one: the message then never
+ *  reaches the peer at all, so instead of one message in two positions we get
+ *  two different documents, permanently. It is appended and reported, and the
+ *  client resolves the placement (R-54).
  */
-test('R-48: an envelope below the committed tip is held, not committed', () => {
+test('R-48: an envelope below the committed tip is appended, and reported', () => {
     const state = mkState({
         me: 'A', members: ['A', 'B'],
         self: { seq: 5, lamport: 9, committedSeq: 5 },
@@ -304,12 +316,10 @@ test('R-48: an envelope below the committed tip is held, not committed', () => {
     const late = { c: 'chan', o: 'B', s: 4, l: 2, id: 'aaa' };
 
     const res = Merge.partition(state, [late], Date.now());
-    assert.strictEqual(res.ready.length, 0,
-        'a late envelope must never be appended after the tip it precedes');
+    assert.deepStrictEqual(res.ready.map(r => r.id), ['aaa'],
+        'a late envelope is stored rather than withheld from the peer');
     assert.deepStrictEqual(res.reordered, [late],
-        'and it must be reported, so the stall is visible');
-    assert.ok(res.held.some(h => h.id === 'aaa'),
-        'it stays in the pending log for RECONCILE to splice');
+        'and reported, because these two logs now order that stretch differently');
 });
 
 /*  The guard must not fire on the normal case, or every channel would stall the
@@ -345,7 +355,118 @@ test('R-48: the tip comparison uses the whole (l, o, id)', () => {
     const late = { c: 'chan', o: 'A', s: 2, l: 7, id: 'aaa' };
 
     const res = Merge.partition(state, [late], Date.now());
-    assert.strictEqual(res.ready.length, 0,
+    assert.deepStrictEqual(res.reordered.map(r => r.id), ['aaa'],
         'an equal clock is not enough: the origin tie-break decides');
-    assert.deepStrictEqual(res.reordered.map(r => r.id), ['aaa']);
+});
+
+/*  A peer's announced sequence is a promise the merge then waits on: nothing
+ *  commits while a member has announced messages we have not received. So a
+ *  value that is too high, once recorded, freezes the channel for good — the
+ *  peer has no way to take it back.
+ *
+ *  Found on a live pad: 37 envelopes sat uncommitted, waiting for sequences 72
+ *  through 126 from an instance whose log ended at 71. Federation looked
+ *  healthy — sessions up, heartbeats flowing — and simply never committed
+ *  anything again.
+ */
+test('a heartbeat may correct a peer sequence downwards', () => {
+    const state = mkState({ me: A, members: [A, B] });
+
+    // an envelope, and then a wrong high value from anywhere
+    Merge.observe(state, B, { seq: 5, lamport: 5 }, Date.now());
+    Merge.observe(state, B, { seq: 126, lamport: 10 }, Date.now());
+    assert.strictEqual(state.peers[B].seq, 126);
+
+    // the peer itself says its log ends at 71: it knows, and it wins
+    Merge.observe(state, B, { seq: 71, lamport: 10, authoritative: true }, Date.now());
+    assert.strictEqual(state.peers[B].seq, 71,
+        'a peer describing its own log must be able to correct it downwards');
+});
+
+/*  Envelopes stay monotonic: one arriving late is evidence of a single message,
+    not a statement about the sender's log, and out-of-order arrival is routine. */
+test('an envelope never pulls a peer sequence backwards', () => {
+    const state = mkState({ me: A, members: [A, B] });
+    Merge.observe(state, B, { seq: 9, lamport: 9 }, Date.now());
+    Merge.observe(state, B, { seq: 4, lamport: 4 }, Date.now());
+    assert.strictEqual(state.peers[B].seq, 9,
+        'an out-of-order envelope must not look like a shorter log');
+});
+
+/*  The point of the fix: once corrected, the completeness barrier stops
+    blocking and the pass commits again. */
+test('correcting the sequence unblocks a frozen channel', () => {
+    const now = Date.now();
+    const state = mkState({
+        me: A, members: [A, B],
+        self: { seq: 3, lamport: 10, committedSeq: 3 },
+        peers: { [B]: { seq: 126, lamport: 10, committedSeq: 1, atime: now } }
+    });
+    const pending = [env(B, 2, 11, 'bbb')];
+
+    // waiting for sequences that will never arrive
+    assert.strictEqual(Merge.partition(state, pending, now).ready.length, 0);
+
+    Merge.observe(state, B, { seq: 2, lamport: 11, authoritative: true }, now);
+    assert.deepStrictEqual(
+        Merge.partition(state, pending, now).ready.map(e => e.id), ['bbb'],
+        'once the peer corrects itself the pass must commit again');
+});
+
+/*  A hole in a member's sequence that no longer exists to be filled.
+ *
+ *  Messages lost in an outage, before anything retained them for resend, leave
+ *  a gap the merge waits on for ever. Federation looks healthy throughout —
+ *  sessions up, heartbeats flowing — and every pass declines to commit for a
+ *  reason that will never stop being true. Found on a live pad sitting at 40
+ *  uncommitted envelopes.
+ */
+test('a gap that never fills is given up on, and the pass continues', () => {
+    const t0 = Date.now();
+    const state = mkState({
+        me: A, members: [A, B],
+        self: { seq: 3, lamport: 20, committedSeq: 3 },
+        // B says its log ends at 6 and its clock at 21; we hold 6 but not 5
+        peers: { [B]: { seq: 6, lamport: 21, committedSeq: 4, atime: t0 } }
+    });
+    const pending = [env(B, 6, 21, 'bbb')];
+
+    assert.strictEqual(Merge.partition(state, pending, t0).ready.length, 0,
+        'it waits while the gap might still fill');
+
+    /*  Noticed, then noticed again much later — with the peer still alive and
+        heartbeating, which is the case that matters. A peer that has gone quiet
+        is evicted and stops blocking anyway; this is the one where everything
+        looks healthy and nothing commits. */
+    Merge.noteStalled(state, Merge.partition(state, pending, t0).stalled, t0);
+    const later = t0 + Merge.GAP_TIMEOUT + 1000;
+    state.peers[B].atime = later;
+    const changed = Merge.noteStalled(state,
+        Merge.partition(state, pending, later).stalled, later);
+
+    assert.ok(changed, 'the gap must eventually be abandoned');
+    assert.strictEqual(state.peers[B].committedSeq, 5,
+        'and stepped over, so the run can continue past it');
+    assert.deepStrictEqual(Merge.partition(state, pending, later).ready.map(e => e.id),
+        ['bbb'], 'the channel commits again');
+});
+
+/*  But not prematurely: a slow backfill must not be mistaken for a lost
+    message, or a repair would be replaced by a permanent mis-ordering. */
+test('a gap that is still filling is not abandoned', () => {
+    const t0 = Date.now();
+    const state = mkState({
+        me: A, members: [A, B],
+        self: { seq: 3, lamport: 20, committedSeq: 3 },
+        peers: { [B]: { seq: 6, lamport: 21, committedSeq: 4, atime: t0 } }
+    });
+    const pending = [env(B, 6, 21, 'bbb')];
+
+    Merge.noteStalled(state, Merge.partition(state, pending, t0).stalled, t0);
+    const soon = t0 + 30 * 1000;
+    state.peers[B].atime = soon;
+    assert.strictEqual(
+        Merge.noteStalled(state, Merge.partition(state, pending, soon).stalled, soon),
+        false, 'half a minute is not long enough to give up on a message');
+    assert.strictEqual(state.peers[B].committedSeq, 4, 'nothing stepped over');
 });

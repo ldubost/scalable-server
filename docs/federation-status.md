@@ -182,6 +182,61 @@ storage budgets and eviction (R-31, R-39), owner-account consent (R-26),
 cross-instance userlists (R-13), Bloom-filter sync, the admin/CLI surface,
 metrics, and `fed/` storage migration.
 
+## Where to pick up
+
+Written at the end of a long session, on a live two-instance rig with real pads.
+
+### The rig, right now
+
+* Running, but on a build from **before** the last change (late arrivals being
+  appended rather than held). Restart it to pick that up: `./stop.sh && ./start.sh`
+  in `experiments/federation`.
+* Data was restored from `experiments/federation-backup-20260809-0824` after a
+  bad repair; the damaged copies are kept as `a/data.damaged-*` / `b/data.damaged-*`
+  and can be deleted once nobody wants to look at them.
+* 30-odd federated channels. All but one of the eight that were split have
+  reconciled. `0a687f8e…` (7309 lines) has not: its audit times out, almost
+  certainly because the id list for a pad that size is too large for one frame.
+
+### Known to be wrong, in priority order
+
+1. **The big pad's audit never completes.** `AUDIT_IDS` sends every committed id
+   in one frame; at 7309 messages that is around 470 KB and exceeds `MAX_FRAME`.
+   It needs paging — send ids in chunks with a cursor, or compare a digest per
+   block and only exchange ids for blocks that differ.
+2. **Integration suites have not been run since the last two merge changes**
+   (gaps scoped to their own origin; late arrivals appended). Unit tests pass at
+   306. Run the integration files individually — see the note above about the
+   suite being unreliable in one invocation — before trusting either change.
+3. **`verify.sh` fails on error-line counts** whenever a pad is mid-repair. The
+   noisy line was `FEDERATION_RECONCILE_REQUIRED`, now downgraded to
+   `FEDERATION_LATE_APPENDED` at info and rate-limited, which should fix it — but
+   that is exactly the untested change in (2).
+4. **A pad reported as not federating** — `M3vYcxaVLlSoc1ZcwAGx2dNz`, channel
+   `7be2b0f9bd350b9270cf64109df5a474` — has no channel file, no federation state
+   and no mention in either log on either instance. It shares its last 24 hex
+   characters with `7bf2b0fd…`, which cannot happen by chance, so the URL is
+   probably a near-miss of another pad's. Worth confirming before investigating.
+
+### Things deliberately left
+
+* **R-28's pad-key signature on control commits**, R-26 owner consent, R-13
+  userlists, R-31/R-39 budgets: all M6, all untouched.
+* **`TRIM` (R-11)**: the precondition is implemented and tested; the command is
+  not, on purpose.
+* **The client's `federate-pad.js` console helper** still exists alongside the
+  toolbar button. Harmless, but redundant now.
+
+### The one lesson worth carrying forward
+
+Three separate mechanisms in this design chose to *stop* rather than risk a
+mis-ordering: the completeness barrier, the gap rule, and the R-48 tip guard.
+Each looked prudent in isolation. Together they meant a pad with one permanent
+hole in its history — a thing that happens after any outage — would silently stop
+federating for good, while every health signal said it was fine. Stopping is not
+the safe default it appears to be. The safe default is to keep the data moving
+and let the client, which can actually read it, resolve the order.
+
 ## Requirement bookkeeping
 
 Every requirement is **done**, **n/a**, or scheduled against a named milestone.

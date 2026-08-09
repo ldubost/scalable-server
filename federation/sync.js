@@ -558,7 +558,10 @@ const onHeartbeat = (Env, session, frame) => {
             channel: entry.c,
             originId: session.originId,
             seq: entry.s,
-            lamport: entry.l
+            lamport: entry.l,
+            /*  This is the peer describing its own log, so it may correct a
+                sequence downwards — see `observe` in merge.js. */
+            authoritative: true
         }, () => {});
 
         /*  Anti-entropy (R-47).

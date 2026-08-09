@@ -594,9 +594,9 @@ const fedAcceptRemoteHandler = (data, cb) => {
 
 // a peer's clock from a heartbeat: what keeps the watermark moving when idle (R-4)
 const fedObserveHandler = (data, cb) => {
-    const { channel, originId, seq, lamport } = data || {};
+    const { channel, originId, seq, lamport, authoritative } = data || {};
     if (!Core.isValidId(channel)) { return void cb('INVALID_CHAN'); }
-    Env.FM.observePeer(channel, originId, { seq, lamport }, (err) => {
+    Env.FM.observePeer(channel, originId, { seq, lamport, authoritative }, (err) => {
         cb(err ? String(err.message || err) : void 0);
     });
 };

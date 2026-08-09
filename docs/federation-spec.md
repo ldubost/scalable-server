@@ -447,13 +447,13 @@ The mechanism, deliberately push-shaped and per-origin:
 > documents. It MUST be spliced in via the replicated `RECONCILE` marker of R-6,
 > so both replicas make the identical choice.
 
-R-48 is **half implemented**, and the half that is built is the one that
-prevents damage. The merge records the committed tip as a full `(l, o, id)` and
-refuses to commit any envelope sorting below it: such an envelope is held in the
-pending log and `FEDERATION_RECONCILE_REQUIRED` is logged at error level. The
-channel stalls for that origin, visibly, rather than appending out of order and
-diverging permanently and silently — a stall is recoverable, a divergence is not,
-and every envelope needed to repair it is still on disk.
+R-48 has been **superseded in practice by R-54**. Holding a late envelope keeps
+it out of the peer's log entirely, so instead of one message in two positions the
+two instances hold two different documents — strictly worse, and permanent. Late
+arrivals are therefore appended and reported (`FEDERATION_LATE_APPENDED`), and
+their placement is the client's to reconcile. The requirement is kept because its
+*analysis* is correct and matters: a reader of this document must understand why
+appending is not free.
 
 What is **not** built is the repair itself: splicing the late envelope into the
 committed log and telling clients to reload. That is R-6's `RECONCILE`. Until it
@@ -1177,7 +1177,7 @@ support, **M6** hardening (quotas, budgets, admin tooling), **M7** the NextGraph
 | R-45 | Blob access is the bearer-capability model; peers redeem ids, never enumerate them (§11.6) | **done** — documented in `blob-transfer.js` and enforced by R-27's allowlist |
 | R-46 | Federation is set up server-to-server; the client never contacts the peer (§5.3b) | **done** — `INVITE` over the existing session; `GET /api/federation/peers` lets the client pick a peer without contacting one |
 | R-47 | Missing messages are detected and repaired without operator action (§5.3c) | **done** — heartbeats carry per-origin `have`; a peer resends its own missing envelopes; envelopes are retained until every member has acknowledged them |
-| R-48 | A repair must splice late arrivals via `RECONCILE`, never reorder (§5.3c) | **partial → M6** — The *never reorder* half is done and enforced: the merge tracks the committed tip as a full `(l, o, id)` and refuses to commit anything sorting below it, logging `FEDERATION_RECONCILE_REQUIRED`. The channel stalls visibly instead of diverging silently, and every envelope stays in the pending log. The *splice* half needs R-6's `RECONCILE` and is not built |
+| R-48 | A repair must splice late arrivals via `RECONCILE`, never reorder (§5.3c) | **superseded by R-54** — late arrivals are appended and reported rather than held. Holding kept them out of the peer's log entirely, which is worse than a differing order and does not heal. The analysis behind the requirement stands and is retained |
 | R-49 | In-channel content federates automatically; out-of-channel data needs its own mechanism (§11c) | **done** — comments/annotations ride in the ChainPad content; blobs are the only exception and are covered by R-44. Corrected by R-50: the pad *chat* is neither — it is a separate channel |
 | R-53 | No window in which a federated write goes unfederated; log-length mismatch is detected and repaired (§11e) | **done** — Storage announces its federated channels to core at startup, closing the window; divergence is detected by exchanging the committed log length on the heartbeat, reported as `FEDERATION_DIVERGED`, and repaired by R-6 |
 | R-52 | Replication is rebuilt from durable state at startup, and membership is per peer rather than per connection (§11d) | **done** — `FM.listFederated` enumerates the state files, `FED_LIST` gathers them across every storage node, and the federation node restores core's federated set and its replica-set membership before dialling out. Membership is also recorded on enable, subscribe and subscribe-ok, so a peer reconnecting is still a member; `federation-restart.test.js` |
