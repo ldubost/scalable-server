@@ -497,6 +497,26 @@ const fedListHandler = (data, cb) => {
     });
 };
 
+/*  The ids in a channel's committed log, and the removal half of a repair
+    (R-6). See `FM.logIds` / `FM.excise`. */
+const fedLogIdsHandler = (data, cb) => {
+    if (!Core.isValidId(data?.channel)) { return void cb('INVALID_CHAN'); }
+    if (!Env.FM?.logIds) { return void cb('ENOFEDERATION'); }
+    Env.FM.logIds(data.channel, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, res);
+    });
+};
+
+const fedExciseHandler = (data, cb) => {
+    if (!Core.isValidId(data?.channel)) { return void cb('INVALID_CHAN'); }
+    if (!Env.FM?.excise) { return void cb('ENOFEDERATION'); }
+    Env.FM.excise(data.channel, data.ids, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, res);
+    });
+};
+
 const fedStateHandler = (data, cb) => {
     Env.FM.state(data?.channel, (err, res) => {
         if (err) { return void cb(String(err.message || err)); }
@@ -691,6 +711,8 @@ let COMMANDS = {
     'FED_ENABLE': fedEnableHandler,
     'FED_STATE': fedStateHandler,
     'FED_LIST': fedListHandler,
+    'FED_LOG_IDS': fedLogIdsHandler,
+    'FED_EXCISE': fedExciseHandler,
     'FED_SINCE': fedSinceHandler,
     'FED_HEAD': fedHeadHandler,
     'FED_INGEST': fedIngestHandler,

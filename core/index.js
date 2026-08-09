@@ -1063,6 +1063,8 @@ const startServers = (mainConfig) => {
         'FED_PING': onFedPing,
         'FED_ENABLE': federationToStorage('FED_ENABLE'),
         'FED_STATE': federationToStorage('FED_STATE'),
+        'FED_LOG_IDS': federationToStorage('FED_LOG_IDS'),
+        'FED_EXCISE': federationToStorage('FED_EXCISE'),
         'FED_LIST': onFederationList,
         'FED_SINCE': federationToStorage('FED_SINCE'),
         'FED_HEAD': federationToStorage('FED_HEAD'),

@@ -189,7 +189,7 @@ Where a requirement was mostly built and the remainder was too small to schedule
 on its own, the remainder is split into a new requirement and the original marked
 done — so "partial" never becomes a place things go to be forgotten.
 
-Current: **38 done**, **3 partial**, 10 scheduled, 2 n/a, of 53.
+Current: **40 done**, **2 partial**, 9 scheduled, 2 n/a, of 53.
 
 The partials are **R-48** (the guard against reordering is built; the splice that
 repairs it is not — see above) and **R-28** (pad-key *and* instance-key authorisation on
@@ -387,12 +387,33 @@ mismatch is reported as `FEDERATION_DIVERGED`, rate-limited to once per channel
 per five minutes because a split pad stays split. Pointed at a live pair it found
 **8 split channels out of 30** immediately.
 
-**Repair is deliberately not attempted.** Re-sending an orphaned message gives it
-a fresh Lamport clock, so the peer appends it at its tail while this instance
-holds it mid-log — the same messages in different orders, which is the divergence
-rather than the cure. Converging properly means both sides rewriting their
-committed logs into the agreed order and telling clients to reload, which is R-6
-`RECONCILE` and rewrites live channel history. Scheduled, not improvised.
+**Repair (R-6) — built.** The obvious approach is wrong: re-sending an orphan
+gives it a fresh Lamport clock, so the peer appends it at its tail while this
+instance holds it mid-log — the same messages in different orders, which is the
+divergence rather than the cure.
+
+So each instance **lifts its own orphans out of its committed log** and federates
+them through the ordinary path, letting the merge place them identically on both
+sides. Repairing only one's own orphans keeps it symmetric: no instance is
+authoritative, and whatever the peer holds and we do not arrives as its own
+repair. Triggered by the length mismatch above, rate-limited to one repair per
+channel per minute.
+
+Two traps found in the process, both silent:
+
+* `filterMessages` decides an operation was valid by a flag only
+  `preserveRemaining()` sets. A multi-line removal that never calls it has its
+  work discarded as `HASH_NOT_FOUND` — the removals happen and are then thrown
+  away.
+* The store's `HK.getHash` is `msg.slice(0, 64)` of the raw content, while a
+  federation id strips the `cp|<hash>|` checkpoint prefix first, because that
+  prefix is not part of what was signed. Matching on the store's hash would fail
+  to find precisely the checkpoints a busy pad has most of.
+
+Removing committed history is the only destructive operation in the design, so it
+takes an explicit list of ids derived from this instance's own log moments
+earlier, returns exactly what it removed, and the store archives the channel
+before rewriting it.
 
 ## Two bugs found by real use, and what they mean
 
@@ -485,7 +506,7 @@ instance does not federate.
 | Suite | Command | Covers |
 | --- | --- | --- |
 | unit | `npm run test:unit` | 301 tests (2 skipped: they need object storage). Handshake, capabilities, envelopes, the total order, the federation log, the merge rule |
-| integration | `npm run test:integration` | 38 tests across 10 files, each booting complete instances as real processes. Includes a **real ChainPad document** suite, a blob suite and an auxiliary-channel suite |
+| integration | `npm run test:integration` | 41 tests across 11 files, each booting complete instances as real processes. Includes a **real ChainPad document** suite, a blob suite and an auxiliary-channel suite |
 | experiments | `docs/experiments/chainpad-ordering/` | The ChainPad ordering findings that shaped §4 and §11 |
 
 `federation-upload.test.js` boots three complete rigs and needs longer than a

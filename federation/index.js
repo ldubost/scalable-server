@@ -103,6 +103,9 @@ const FEDERATION_COMMANDS = {
 
     // multi-master (M3)
     'HEARTBEAT': Sync.onHeartbeat,
+    // repairing a split pad (R-6)
+    'AUDIT_REQ': Sync.onAuditRequest,
+    'AUDIT_IDS': Sync.onAuditIds,
 
     // blobs (M5)
     'BLOB_REQ': BlobTransfer.onRequest,
@@ -548,6 +551,9 @@ const start = (mainConfig) => {
         pendingPings: new Map(),
         // channel -> when we last said it had diverged (R-53)
         divergedAt: new Map(),
+        // repairs in flight, and when each channel was last repaired (R-6)
+        repairs: new Map(),
+        repairedAt: new Map(),
         federationCommands: FEDERATION_COMMANDS
     };
     Environment.init(Env, mainConfig);

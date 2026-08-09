@@ -1072,6 +1072,30 @@ bookkeeping. The length of the committed log is that number.
 > fresh clock and append it at the peer's tail while it sits mid-log here, which
 > is the divergence rather than the cure.
 
+**R-6, as built.** Each instance lifts its *own* orphans out of its committed log
+and federates them through the ordinary path. The merge then places them, on both
+instances, using the same total order — the machinery that was missing when they
+were first written. Excising first is what makes the two converge on one
+sequence rather than on the same set in two arrangements; and repairing only
+one's own orphans keeps the operation symmetric, with no question of which
+instance is authoritative.
+
+    AUDIT_REQ  {c}         "which messages do you hold?"
+    AUDIT_IDS  {c, ids}    the ids in my committed log, in order
+
+Removing committed history is the one destructive operation in this design, so
+it is narrow by construction: an explicit list of ids, derived from this
+instance's own log moments earlier, returning exactly what it removed. The
+underlying store archives the channel before rewriting it.
+
+Two traps are worth recording, because both fail silently. `filterMessages`
+decides an operation was valid by a flag only `preserveRemaining()` sets, so a
+multi-line removal that never calls it has its work discarded as
+`HASH_NOT_FOUND`. And the store's `HK.getHash` is `msg.slice(0, 64)` of the raw
+content, while a federation id strips the `cp|<hash>|` checkpoint prefix first —
+matching on the former would fail to find precisely the checkpoints a busy pad
+has most of.
+
 ---
 
 ## 12. Requirement index
@@ -1101,7 +1125,7 @@ support, **M6** hardening (quotas, budgets, admin tooling), **M7** the NextGraph
 | R-3 | Commit only up to the watermark `W`, in sort order | **done** — `Merge.partition` commits only `l <= W`, in sort order |
 | R-4 | Heartbeats keep `W` advancing when idle | **done** — Heartbeats carry each member's *promise* clock, so an idle channel still commits |
 | R-5 | Provisionally evict unreachable peers so `W` advances | **done** — A member silent for `EVICT_AFTER` stops holding the watermark back; a periodic sweep re-runs the merge so eviction alone can unblock it |
-| R-6 | Late envelopes append with a replicated `RECONCILE` marker | M3 — **Not done.** An evicted peer's return is detected and flagged, but its backlog is not spliced in with a replicated marker |
+| R-6 | Reconcile: a divergence is repaired rather than appended over | **done** — `AUDIT_REQ`/`AUDIT_IDS` compare committed logs; each instance excises its own orphans and re-federates them, so the merge places them identically on both. `federation-reconcile.test.js` covers two-sided and one-sided splits and pins that a healthy pad is never rewritten. Repair of a *late envelope* that sorts below the committed tip is still refused rather than spliced (R-48) |
 | R-7 | Broadcast live without waiting for commitment | **done** — A remote edit is broadcast to local readers when it *arrives*, not when it commits; the live and committed tiers are deliberately different moments |
 | R-8 | History = committed prefix + sorted uncommitted tail | **done** — `getHistoryAsync` serves the committed prefix and then the sorted uncommitted tail |
 | R-9 | Persist before acknowledging a local client | **done** — A write is durable in the pending log before the client is acknowledged; the sequence is persisted before it is issued |
@@ -1145,7 +1169,7 @@ support, **M6** hardening (quotas, budgets, admin tooling), **M7** the NextGraph
 | R-47 | Missing messages are detected and repaired without operator action (§5.3c) | **done** — heartbeats carry per-origin `have`; a peer resends its own missing envelopes; envelopes are retained until every member has acknowledged them |
 | R-48 | A repair must splice late arrivals via `RECONCILE`, never reorder (§5.3c) | **partial → M6** — The *never reorder* half is done and enforced: the merge tracks the committed tip as a full `(l, o, id)` and refuses to commit anything sorting below it, logging `FEDERATION_RECONCILE_REQUIRED`. The channel stalls visibly instead of diverging silently, and every envelope stays in the pending log. The *splice* half needs R-6's `RECONCILE` and is not built |
 | R-49 | In-channel content federates automatically; out-of-channel data needs its own mechanism (§11c) | **done** — comments/annotations ride in the ChainPad content; blobs are the only exception and are covered by R-44. Corrected by R-50: the pad *chat* is neither — it is a separate channel |
-| R-53 | No window in which a federated write goes unfederated; log-length mismatch is detected and reported (§11e) | **partial → M6** — Storage announces its federated channels to core at startup, closing the window. Divergence is detected by exchanging the committed log length on the heartbeat and reported as `FEDERATION_DIVERGED`. Repair of an already-split pad needs R-6 and is not built |
+| R-53 | No window in which a federated write goes unfederated; log-length mismatch is detected and repaired (§11e) | **done** — Storage announces its federated channels to core at startup, closing the window; divergence is detected by exchanging the committed log length on the heartbeat, reported as `FEDERATION_DIVERGED`, and repaired by R-6 |
 | R-52 | Replication is rebuilt from durable state at startup, and membership is per peer rather than per connection (§11d) | **done** — `FM.listFederated` enumerates the state files, `FED_LIST` gathers them across every storage node, and the federation node restores core's federated set and its replica-set membership before dialling out. Membership is also recorded on enable, subscribe and subscribe-ok, so a peer reconnecting is still a member; `federation-restart.test.js` |
 | R-51 | A blob reference resolves against the reader's own instance, not the uploader's (§11.6) | **done** — `media-tag.js` redirects an absolute `/blob/<xx>/<id>` src to the instance the reader is on, configured by `sframe-common.js` from `fileHost`/`origin`. Without it the request never arrives and R-44 never fires |
 | R-50 | A pad's auxiliary channels (the chat) federate with it; ephemeral ones do not (§11c) | **done** — the client enumerates `chat2` and mints a capability per channel from the pad key; `GET /api/federation/channel/:channel` reports membership so a chat opened after federation catches up; `federation-auxiliary.test.js` |

@@ -369,6 +369,85 @@ const create = (Env) => {
         });
     };
 
+    /*  Every message id in the committed log, in order (R-6).
+
+        The repair works on the log itself rather than on federation
+        bookkeeping, because the messages it has to find are precisely the ones
+        the bookkeeping never saw. Ids, not contents: a peer needs to know *which*
+        messages we hold, and shipping the documents themselves to answer that
+        would be both large and pointless.
+    */
+    FM.logIds = (channel, cb) => {
+        const ids = [];
+        Env.store.readMessagesBin(channel, 0, (msgObj, readMore) => {
+            let line;
+            try {
+                line = msgObj.buff.toString('utf8');
+            } catch (e) { return void readMore(); }
+            if (!ARRAY_LINE.test(line)) { return void readMore(); }
+            try {
+                const content = JSON.parse(line)[4];
+                if (typeof (content) === 'string') { ids.push(Ids.fromContent(content)); }
+            } catch (e) { /* skip unreadable line */ }
+            readMore();
+        }, (err) => {
+            if (err && !missing(err)) { return void cb(err); }
+            cb(void 0, { ids });
+        });
+    };
+
+    /*  Lift a set of messages out of the committed log and hand back their
+        contents, so they can be federated properly (R-6).
+
+        This is the one operation in the whole design that *removes* committed
+        history, so it is deliberately narrow: it takes an explicit list of ids,
+        returns exactly what it removed, and does nothing else. The caller
+        re-federates those contents through the ordinary path, where the merge
+        gives them positions both instances agree on — which is the entire point,
+        since their problem was never having had one.
+
+        Contents are read before the rewrite, not after: if the rewrite succeeds
+        and the read fails, the messages are gone.
+    */
+    FM.excise = (channel, ids, cb) => {
+        const wanted = new Set(Array.isArray(ids) ? ids : []);
+        if (!wanted.size) { return void cb(void 0, { messages: [] }); }
+        if (typeof (Env.store.deleteChannelLines) !== 'function') {
+            return void cb(new Error('E_NO_EXCISE'));
+        }
+
+        const messages = [];
+        Env.store.readMessagesBin(channel, 0, (msgObj, readMore) => {
+            let line;
+            try {
+                line = msgObj.buff.toString('utf8');
+            } catch (e) { return void readMore(); }
+            if (!ARRAY_LINE.test(line)) { return void readMore(); }
+            try {
+                const parsed = JSON.parse(line);
+                const content = parsed[4];
+                if (typeof (content) === 'string') {
+                    const id = Ids.fromContent(content);
+                    if (wanted.has(id)) {
+                        messages.push({ id, content, time: parsed[5] });
+                    }
+                }
+            } catch (e) { /* skip unreadable line */ }
+            readMore();
+        }, (err) => {
+            if (err && !missing(err)) { return void cb(err); }
+            if (!messages.length) { return void cb(void 0, { messages: [] }); }
+
+            Env.store.deleteChannelLines(channel, messages.map(m => m.id), (e) => {
+                if (e) { return void cb(e); }
+                Env.Log.info('FEDERATION_EXCISED', {
+                    channel, count: messages.length
+                });
+                cb(void 0, { messages });
+            });
+        });
+    };
+
     /*  Ingest one remote envelope into the committed log.
 
         The order of checks is deliberate: structural first (cheap, and catches

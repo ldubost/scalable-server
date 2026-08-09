@@ -571,9 +571,10 @@ const onHeartbeat = (Env, session, frame) => {
                     channel: entry.c,
                     peer: Env.policy.describe(session.originId),
                     mine: info.count,
-                    theirs: entry.n,
-                    note: 'logs differ in length; needs RECONCILE (R-6)'
+                    theirs: entry.n
                 });
+                // and fix it (R-6)
+                requestRepair(Env, session, entry.c);
             });
         }
 
@@ -589,6 +590,149 @@ const onHeartbeat = (Env, session, frame) => {
             });
         });
     });
+};
+
+// --------------------------------------------------------------- RECONCILE
+
+/*  Repairing a split pad (spec R-6, R-53).
+
+        AUDIT_REQ  {c}           "which messages do you hold?"
+        AUDIT_IDS  {c, ids}      the ids in my committed log, in order
+
+    Why this exists
+    ---------------
+    A message committed while core did not know the channel was federated never
+    entered the federation order, so it has no sequence: no gap, nothing to
+    resend, and every mechanism in §4 blind to it. Two instances end up serving
+    different documents while agreeing on every counter they exchange.
+
+    How it repairs
+    --------------
+    Not by sending the message across, which is the obvious move and the wrong
+    one: a re-sent message gets a fresh clock, so the peer appends it at its tail
+    while we hold it mid-log — the same messages in different orders, which is
+    the divergence rather than the cure.
+
+    Instead each instance **lifts its own orphans out of its log** and federates
+    them through the ordinary path. The merge then places them, on both
+    instances, at positions derived from the same total order — which is exactly
+    the machinery that was missing when they were first written. Both sides
+    converge on the union, and neither has to trust the other's ordering.
+
+    Each instance repairs only its own orphans. That keeps the operation
+    symmetric and removes any question of who is authoritative: whatever the peer
+    holds and we do not will arrive as its own repair.
+*/
+
+// one repair per channel at a time, and not more often than this
+const REPAIR_COOLDOWN = 60 * 1000;
+
+const onAuditRequest = (Env, session, frame) => {
+    const channel = frame?.c;
+    if (!Env.isSubscribed(session, channel)) { return; }
+    toStorage(Env, 'FED_LOG_IDS', { channel }, (e, res) => {
+        if (e) {
+            return void Env.Log.error('FEDERATION_AUDIT_ERROR',
+                { channel, error: String(e) });
+        }
+        session.send({ type: 'AUDIT_IDS', c: channel, ids: res?.ids || [] });
+    });
+};
+
+const onAuditIds = (Env, session, frame) => {
+    const channel = frame?.c;
+    if (!Env.isSubscribed(session, channel)) { return; }
+    const pending = Env.repairs.get(channel);
+    if (!pending || pending.originId !== session.originId) { return; }
+    clearTimeout(pending.timer);
+
+    const theirs = new Set(Array.isArray(frame.ids) ? frame.ids : []);
+
+    toStorage(Env, 'FED_LOG_IDS', { channel }, (e, res) => {
+        const finish = () => {
+            Env.repairs.delete(channel);
+            Env.repairedAt.set(channel, Date.now());
+        };
+        if (e) {
+            Env.Log.error('FEDERATION_AUDIT_ERROR', { channel, error: String(e) });
+            return void finish();
+        }
+
+        /*  Ours that they lack. Some of these may be in flight rather than
+            orphaned, and re-federating one of those is harmless — it arrives as
+            a duplicate, which R-18 makes a no-op. Waiting to be sure would mean
+            never being sure. */
+        const mine = res?.ids || [];
+        const orphans = mine.filter(id => !theirs.has(id));
+        if (!orphans.length) {
+            Env.Log.info('FEDERATION_REPAIR_NOTHING', { channel });
+            return void finish();
+        }
+
+        Env.Log.info('FEDERATION_REPAIR_START', {
+            channel,
+            peer: Env.policy.describe(session.originId),
+            orphans: orphans.length
+        });
+
+        toStorage(Env, 'FED_EXCISE', { channel, ids: orphans }, (e2, out) => {
+            if (e2) {
+                Env.Log.error('FEDERATION_REPAIR_ERROR', { channel, error: String(e2) });
+                return void finish();
+            }
+            const messages = out?.messages || [];
+
+            /*  Federate them one at a time and in log order, so the sequence
+                this instance allocates preserves the order the author wrote
+                them in. Sending them in parallel would allocate sequences in
+                whatever order the callbacks happened to fire. */
+            let i = 0;
+            const step = () => {
+                if (i >= messages.length) {
+                    Env.Log.info('FEDERATION_REPAIR_DONE', {
+                        channel, refederated: messages.length
+                    });
+                    return void finish();
+                }
+                const m = messages[i++];
+                acceptLocal(Env, {
+                    channel, content: m.content, time: m.time
+                }, (err) => {
+                    if (err) {
+                        Env.Log.error('FEDERATION_REPAIR_ERROR',
+                            { channel, id: m.id, error: String(err) });
+                    }
+                    setTimeout(step, 0);
+                });
+            };
+            step();
+        });
+    });
+};
+
+/*  Start a repair: ask the peer what it holds. Everything else follows from the
+    answer. */
+const requestRepair = (Env, session, channel) => {
+    /*  L2 only. The repair works by re-federating a message as our own, which a
+        mirror may not do: at L1 the anchor is the single ordering authority and
+        a mirror's writes go through it. A mirror that diverged has a different
+        problem, and inventing local writes to fix it would create a worse one. */
+    if (!Env.multiMaster.has(channel)) { return; }
+    if (Env.repairs.has(channel)) { return; }
+    const last = Env.repairedAt.get(channel) || 0;
+    if (Date.now() - last < REPAIR_COOLDOWN) { return; }
+
+    Env.repairs.set(channel, {
+        originId: session.originId,
+        timer: setTimeout(() => {
+            Env.repairs.delete(channel);
+            Env.Log.error('FEDERATION_REPAIR_TIMEOUT', { channel });
+        }, 60 * 1000)
+    });
+    if (!session.send({ type: 'AUDIT_REQ', c: channel })) {
+        clearTimeout(Env.repairs.get(channel)?.timer);
+        Env.repairs.delete(channel);
+    }
 };
 
 // --------------------------------------------------------------- INVITE
@@ -708,5 +852,6 @@ module.exports = {
     onControl, publishControl, onInvite,
     acceptLocal, onHeartbeat, heartbeatState,
     requestSync,
+    onAuditRequest, onAuditIds, requestRepair,
     SYNC_BATCH
 };

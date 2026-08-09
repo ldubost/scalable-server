@@ -327,6 +327,24 @@ CachedFile.create = function (conf, _cb) {
                 });
             });
         },
+        /*  Federation repair (R-6): the cached store has to hydrate, flush and
+            re-flush around the rewrite exactly as a single-line delete does, or
+            the cache would keep serving the lines that were just removed. */
+        deleteChannelLines: (channelName, hashes, cb) => {
+            guard(channelName, cb, () => {
+                hydrateBoth(channelName, err => {
+                    if (err) { return void cb(err); }
+                    flushChannel(channelName, () => {
+                        inner.deleteChannelLines(channelName, hashes, (err, res) => {
+                            if (err) { return void cb(err); }
+                            touch(relData(channelName));
+                            touch(relMetadata(channelName));
+                            flushChannel(channelName, (e) => cb(e, res));
+                        });
+                    });
+                });
+            });
+        },
         deleteChannelLine: (channelName, hash, checkRights, cb) => {
             guard(channelName, cb, () => {
                 hydrateBoth(channelName, err => {
