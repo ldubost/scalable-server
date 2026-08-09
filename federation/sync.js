@@ -31,6 +31,35 @@ const Ids = require('../common/federation/ids.js');
 // a split pad stays split, so say so occasionally rather than every heartbeat
 const DIVERGENCE_LOG_EVERY = 5 * 60 * 1000;
 
+/*  How long a cached log length may be trusted.
+
+    Counting the committed log means reading all of it, so this must not sit on
+    the heartbeat path: at a 2 s beat, a pad of a few thousand messages would be
+    re-read thirty times a minute per peer, and — worse — an early version made
+    the beat *wait* for the count, so a slow read stopped the heartbeat
+    altogether and with it the watermark that keeps an idle channel committing.
+
+    Staleness costs nothing here. The number exists to notice a divergence, a
+    divergence persists, and acting on it is rate-limited well beyond this. */
+const COUNT_TTL = 30 * 1000;
+
+/*  The last known length of a channel's committed log, refreshed in the
+    background. Returns undefined until the first read completes, which simply
+    means the first heartbeat for a channel carries no count. */
+const logCount = (Env, channel) => {
+    const hit = Env.logCounts.get(channel);
+    const fresh = hit && (Date.now() - hit.at) < COUNT_TTL;
+    if (!fresh && !Env.logCountsInFlight.has(channel)) {
+        Env.logCountsInFlight.add(channel);
+        toStorage(Env, 'FED_HEAD', { channel }, (e, info) => {
+            Env.logCountsInFlight.delete(channel);
+            if (e || typeof (info?.count) !== 'number') { return; }
+            Env.logCounts.set(channel, { at: Date.now(), n: info.count });
+        });
+    }
+    return hit ? hit.n : undefined;
+};
+
 const SYNC_BATCH = 256;
 
 /*  requestSync and the SYNC_RES handler call each other: a response that is not
@@ -503,15 +532,14 @@ const heartbeatState = (Env, session) => {
                     contradict it. */
                 /*  What we hold, per origin, so the peer can resend anything we
                     are missing (R-47). */
+                const known = logCount(Env, channel);
+                if (typeof (known) === 'number') { entry.n = known; }
                 toStorage(Env, 'FED_HAVE', { channel }, (e2, h) => {
                     if (!e2 && h?.have) { entry.have = h.have; }
-                    toStorage(Env, 'FED_HEAD', { channel }, (e3, info) => {
-                    if (!e3 && typeof (info?.count) === 'number') { entry.n = info.count; }
                     out.push(entry);
                     if (--pending === 0 && out.length) {
                         session.send({ type: 'HEARTBEAT', channels: out });
                     }
-                    });
                 });
                 return;
             }
@@ -558,24 +586,22 @@ const onHeartbeat = (Env, session, frame) => {
             Rate-limited per channel: this rides a 2 s heartbeat and a divergence
             persists, so without it one split pad would fill the log. */
         if (typeof (entry.n) === 'number') {
-            toStorage(Env, 'FED_HEAD', { channel: entry.c }, (eh, info) => {
-                if (eh || typeof (info?.count) !== 'number') { return; }
-                if (info.count === entry.n) {
-                    Env.divergedAt.delete(entry.c);
-                    return;
-                }
+            const mine = logCount(Env, entry.c);
+            if (typeof (mine) === 'number' && mine !== entry.n) {
                 const last = Env.divergedAt.get(entry.c) || 0;
-                if (Date.now() - last < DIVERGENCE_LOG_EVERY) { return; }
-                Env.divergedAt.set(entry.c, Date.now());
-                Env.Log.error('FEDERATION_DIVERGED', {
-                    channel: entry.c,
-                    peer: Env.policy.describe(session.originId),
-                    mine: info.count,
-                    theirs: entry.n
-                });
+                if (Date.now() - last >= DIVERGENCE_LOG_EVERY) {
+                    Env.divergedAt.set(entry.c, Date.now());
+                    Env.Log.error('FEDERATION_DIVERGED', {
+                        channel: entry.c,
+                        peer: Env.policy.describe(session.originId),
+                        mine, theirs: entry.n
+                    });
+                }
                 // and fix it (R-6)
                 requestRepair(Env, session, entry.c);
-            });
+            } else if (mine === entry.n) {
+                Env.divergedAt.delete(entry.c);
+            }
         }
 
         if (!entry.have) { return; }
@@ -596,8 +622,9 @@ const onHeartbeat = (Env, session, frame) => {
 
 /*  Repairing a split pad (spec R-6, R-53).
 
-        AUDIT_REQ  {c}           "which messages do you hold?"
-        AUDIT_IDS  {c, ids}      the ids in my committed log, in order
+        AUDIT_REQ   {c}            "which messages do you hold?"
+        AUDIT_IDS   {c, ids}       the ids in my committed log, in order
+        REPAIR_MSG  {c, messages}  the ones you were missing
 
     Why this exists
     ---------------
@@ -606,26 +633,28 @@ const onHeartbeat = (Env, session, frame) => {
     resend, and every mechanism in §4 blind to it. Two instances end up serving
     different documents while agreeing on every counter they exchange.
 
-    How it repairs
-    --------------
-    Not by sending the message across, which is the obvious move and the wrong
-    one: a re-sent message gets a fresh clock, so the peer appends it at its tail
-    while we hold it mid-log — the same messages in different orders, which is
-    the divergence rather than the cure.
+    Append-only, on purpose
+    -----------------------
+    The repair makes both instances hold *everything*. It never removes a stored
+    patch and never moves one, because a patch is somebody's work and no server
+    is in a position to decide otherwise — it cannot read the content, and the
+    party that can, the client, already resolves a chain it receives out of
+    order.
 
-    Instead each instance **lifts its own orphans out of its log** and federates
-    them through the ordinary path. The merge then places them, on both
-    instances, at positions derived from the same total order — which is exactly
-    the machinery that was missing when they were first written. Both sides
-    converge on the union, and neither has to trust the other's ordering.
-
-    Each instance repairs only its own orphans. That keeps the operation
-    symmetric and removes any question of who is authoritative: whatever the peer
-    holds and we do not will arrive as its own repair.
+    An earlier version did try to be cleverer: it lifted its own unfederated
+    messages out of the log and re-federated them, so that the merge would give
+    both instances one identical order. That was wrong twice. It deleted
+    committed history to achieve tidiness, and it could not tell an orphan from a
+    message that was merely *in flight* — so on a busy pad it excised and re-sent
+    perfectly good messages, the divergence outlived the retry interval, and each
+    round moved more of them. Measured on a live pair: a gap of 8 messages grew to
+    117 in three minutes. Appending cannot do that, whatever it gets wrong.
 */
 
 // one repair per channel at a time, and not more often than this
 const REPAIR_COOLDOWN = 60 * 1000;
+// a repair frame carries at most this many messages; the rest follow next round
+const REPAIR_BATCH = 64;
 
 const onAuditRequest = (Env, session, frame) => {
     const channel = frame?.c;
@@ -646,66 +675,64 @@ const onAuditIds = (Env, session, frame) => {
     if (!pending || pending.originId !== session.originId) { return; }
     clearTimeout(pending.timer);
 
-    const theirs = new Set(Array.isArray(frame.ids) ? frame.ids : []);
+    const finish = () => {
+        Env.repairs.delete(channel);
+        Env.repairedAt.set(channel, Date.now());
+    };
 
+    const theirs = new Set(Array.isArray(frame.ids) ? frame.ids : []);
     toStorage(Env, 'FED_LOG_IDS', { channel }, (e, res) => {
-        const finish = () => {
-            Env.repairs.delete(channel);
-            Env.repairedAt.set(channel, Date.now());
-        };
         if (e) {
             Env.Log.error('FEDERATION_AUDIT_ERROR', { channel, error: String(e) });
             return void finish();
         }
-
-        /*  Ours that they lack. Some of these may be in flight rather than
-            orphaned, and re-federating one of those is harmless — it arrives as
-            a duplicate, which R-18 makes a no-op. Waiting to be sure would mean
-            never being sure. */
-        const mine = res?.ids || [];
-        const orphans = mine.filter(id => !theirs.has(id));
-        if (!orphans.length) {
-            Env.Log.info('FEDERATION_REPAIR_NOTHING', { channel });
+        const missing = (res?.ids || []).filter(id => !theirs.has(id));
+        if (!missing.length) {
+            Env.Log.verbose('FEDERATION_REPAIR_NOTHING', { channel });
             return void finish();
         }
 
-        Env.Log.info('FEDERATION_REPAIR_START', {
-            channel,
-            peer: Env.policy.describe(session.originId),
-            orphans: orphans.length
-        });
-
-        toStorage(Env, 'FED_EXCISE', { channel, ids: orphans }, (e2, out) => {
+        /*  Bounded per round. A pad that has been split for a long time can be
+            missing thousands of messages, and one frame holding all of them
+            would exceed MAX_FRAME; the next audit picks up the remainder. */
+        const batch = missing.slice(0, REPAIR_BATCH);
+        toStorage(Env, 'FED_CONTENTS', { channel, ids: batch }, (e2, out) => {
             if (e2) {
                 Env.Log.error('FEDERATION_REPAIR_ERROR', { channel, error: String(e2) });
                 return void finish();
             }
             const messages = out?.messages || [];
+            if (!messages.length) { return void finish(); }
 
-            /*  Federate them one at a time and in log order, so the sequence
-                this instance allocates preserves the order the author wrote
-                them in. Sending them in parallel would allocate sequences in
-                whatever order the callbacks happened to fire. */
-            let i = 0;
-            const step = () => {
-                if (i >= messages.length) {
-                    Env.Log.info('FEDERATION_REPAIR_DONE', {
-                        channel, refederated: messages.length
-                    });
-                    return void finish();
-                }
-                const m = messages[i++];
-                acceptLocal(Env, {
-                    channel, content: m.content, time: m.time
-                }, (err) => {
-                    if (err) {
-                        Env.Log.error('FEDERATION_REPAIR_ERROR',
-                            { channel, id: m.id, error: String(err) });
-                    }
-                    setTimeout(step, 0);
-                });
-            };
-            step();
+            Env.Log.info('FEDERATION_REPAIR_SEND', {
+                channel,
+                peer: Env.policy.describe(session.originId),
+                sending: messages.length,
+                remaining: missing.length - batch.length
+            });
+            session.send({ type: 'REPAIR_MSG', c: channel, messages });
+            finish();
+        });
+    });
+};
+
+/*  Messages a peer holds and we did not. Stored as they are: this is the point
+    at which both instances come to hold everything. */
+const onRepairMessages = (Env, session, frame) => {
+    const channel = frame?.c;
+    if (!Env.isSubscribed(session, channel)) { return; }
+    const messages = Array.isArray(frame.messages) ? frame.messages : [];
+    if (!messages.length) { return; }
+
+    toStorage(Env, 'FED_ABSORB', { channel, messages }, (e, res) => {
+        if (e) {
+            return void Env.Log.error('FEDERATION_REPAIR_ERROR',
+                { channel, error: String(e) });
+        }
+        Env.Log.info('FEDERATION_REPAIRED', {
+            channel,
+            peer: Env.policy.describe(session.originId),
+            absorbed: res?.absorbed || 0
         });
     });
 };
@@ -713,11 +740,6 @@ const onAuditIds = (Env, session, frame) => {
 /*  Start a repair: ask the peer what it holds. Everything else follows from the
     answer. */
 const requestRepair = (Env, session, channel) => {
-    /*  L2 only. The repair works by re-federating a message as our own, which a
-        mirror may not do: at L1 the anchor is the single ordering authority and
-        a mirror's writes go through it. A mirror that diverged has a different
-        problem, and inventing local writes to fix it would create a worse one. */
-    if (!Env.multiMaster.has(channel)) { return; }
     if (Env.repairs.has(channel)) { return; }
     const last = Env.repairedAt.get(channel) || 0;
     if (Date.now() - last < REPAIR_COOLDOWN) { return; }
@@ -852,6 +874,6 @@ module.exports = {
     onControl, publishControl, onInvite,
     acceptLocal, onHeartbeat, heartbeatState,
     requestSync,
-    onAuditRequest, onAuditIds, requestRepair,
+    onAuditRequest, onAuditIds, onRepairMessages, requestRepair,
     SYNC_BATCH
 };

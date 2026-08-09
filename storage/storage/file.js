@@ -1214,61 +1214,6 @@ var deleteChannelLine = function (env, channelName, hash, checkRights, _cb) {
     };
     filterMessages(env, channelName, check, handler, _cb);
 };
-/*  Remove a set of lines from a channel, identified by their message hashes.
-
-    Federation repair (spec R-6). Two instances can end up holding the same
-    document with different messages in it — a message committed while the
-    server did not know the channel was federated never enters the federation
-    order, so nothing detects or repairs it. Fixing that means re-federating
-    those messages so both instances order them identically, and they must first
-    be lifted out of the log they are sitting in, or the repaired instance would
-    hold each of them twice, in two different places.
-
-    Deliberately not gated on `meta.deleteLines`, which is a per-channel
-    permission for mailbox owners deleting their own messages. This is not a user
-    action: it is the server reconciling its own log with a peer's, and the pads
-    it applies to will never carry that flag.
-
-    One pass for the whole set, and one blocking slot on the channel, rather than
-    a pass per line: rewriting a channel is the expensive part, and doing it
-    repeatedly widens the window in which the log is inconsistent.
-*/
-var deleteChannelLines = function (env, channelName, hashes, _cb) {
-    var wanted = new Set(Array.isArray(hashes) ? hashes : []);
-    if (!wanted.size) { return void _cb(void 0, { removed: [] }); }
-    var removed = [];
-    var check = function () { return true; };
-
-    var handler = function (msg, msgHash, abort, remove, preserve, preserveRemaining) {
-        /*  Match on the id federation uses, not on the hash `filterMessages`
-            computed. They agree for an ordinary message and differ for a
-            checkpoint, whose `cp|<hash>|` prefix is not part of what was signed:
-            federation strips it so that one message has one id however it was
-            seen (see common/federation/ids.js). Matching on the raw slice would
-            silently fail to find exactly the messages a busy pad has most of. */
-        var content = msg[4];
-        var id = typeof (content) === 'string'
-            ? content.replace(/^cp\|([A-Za-z0-9+\/=]+\|)?/, '').slice(0, 64)
-            : msgHash;
-
-        if (!wanted.has(id)) { return void preserve(); }
-
-        removed.push(id);
-        /*  Once the last one is found there is nothing left to look for, so the
-            rest of the channel can be copied verbatim. This also sets the flag
-            `filterMessages` uses to decide the operation found its target —
-            without it a successful removal is reported as HASH_NOT_FOUND and
-            thrown away. */
-        if (removed.length === wanted.size) { preserveRemaining(); }
-        remove();
-    };
-
-    filterMessages(env, channelName, check, handler, function (err) {
-        if (err) { return void _cb(err); }
-        _cb(void 0, { removed: removed });
-    });
-};
-
 var trimChannel = function (env, channelName, hash, _cb) {
     var handler = function (msg, msgHash, abort, remove, preserve, preserveRemaining) {
         if (msgHash === hash) {
@@ -1413,12 +1358,6 @@ module.exports.create = function (conf, _cb) {
                 if (!isValidChannelId(channelName)) { return void cb(new Error('EINVAL')); }
                 schedule.blocking(channelName, function (next) {
                     trimChannel(env, channelName, hash, Util.both(cb, next));
-                });
-            },
-            deleteChannelLines: function (channelName, hashes, cb) {
-                if (!isValidChannelId(channelName)) { return void cb(new Error('EINVAL')); }
-                schedule.blocking(channelName, function (next) {
-                    deleteChannelLines(env, channelName, hashes, Util.both(cb, next));
                 });
             },
             deleteChannelLine: function (channelName, hash, checkRights, cb) {

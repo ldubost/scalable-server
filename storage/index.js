@@ -508,10 +508,21 @@ const fedLogIdsHandler = (data, cb) => {
     });
 };
 
-const fedExciseHandler = (data, cb) => {
+/*  The two halves of a repair: hand over what a peer lacks, and take in what we
+    lack. Both are append-only — see `FM.absorb`. */
+const fedContentsHandler = (data, cb) => {
     if (!Core.isValidId(data?.channel)) { return void cb('INVALID_CHAN'); }
-    if (!Env.FM?.excise) { return void cb('ENOFEDERATION'); }
-    Env.FM.excise(data.channel, data.ids, (err, res) => {
+    if (!Env.FM?.contentsFor) { return void cb('ENOFEDERATION'); }
+    Env.FM.contentsFor(data.channel, data.ids, (err, res) => {
+        if (err) { return void cb(String(err.message || err)); }
+        cb(void 0, res);
+    });
+};
+
+const fedAbsorbHandler = (data, cb) => {
+    if (!Core.isValidId(data?.channel)) { return void cb('INVALID_CHAN'); }
+    if (!Env.FM?.absorb) { return void cb('ENOFEDERATION'); }
+    Env.FM.absorb(data.channel, data.messages, (err, res) => {
         if (err) { return void cb(String(err.message || err)); }
         cb(void 0, res);
     });
@@ -712,7 +723,8 @@ let COMMANDS = {
     'FED_STATE': fedStateHandler,
     'FED_LIST': fedListHandler,
     'FED_LOG_IDS': fedLogIdsHandler,
-    'FED_EXCISE': fedExciseHandler,
+    'FED_CONTENTS': fedContentsHandler,
+    'FED_ABSORB': fedAbsorbHandler,
     'FED_SINCE': fedSinceHandler,
     'FED_HEAD': fedHeadHandler,
     'FED_INGEST': fedIngestHandler,

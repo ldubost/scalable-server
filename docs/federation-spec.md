@@ -1072,29 +1072,38 @@ bookkeeping. The length of the committed log is that number.
 > fresh clock and append it at the peer's tail while it sits mid-log here, which
 > is the divergence rather than the cure.
 
-**R-6, as built.** Each instance lifts its *own* orphans out of its committed log
-and federates them through the ordinary path. The merge then places them, on both
-instances, using the same total order — the machinery that was missing when they
-were first written. Excising first is what makes the two converge on one
-sequence rather than on the same set in two arrangements; and repairing only
-one's own orphans keeps the operation symmetric, with no question of which
-instance is authoritative.
+**R-6, as built: append-only.** Each instance sends the peer the messages the
+peer lacks, and the peer stores them. Both then hold everything, each keeping its
+own order, and reconciling that is the client's business — it holds the keys, it
+can read the content, and ChainPad already resolves a chain it receives out of
+order.
 
-    AUDIT_REQ  {c}         "which messages do you hold?"
-    AUDIT_IDS  {c, ids}    the ids in my committed log, in order
+    AUDIT_REQ   {c}            "which messages do you hold?"
+    AUDIT_IDS   {c, ids}       the ids in my committed log, in order
+    REPAIR_MSG  {c, messages}  the ones you were missing
 
-Removing committed history is the one destructive operation in this design, so
-it is narrow by construction: an explicit list of ids, derived from this
-instance's own log moments earlier, returning exactly what it removed. The
-underlying store archives the channel before rewriting it.
+> **R-54 (Repair never destroys).** A repair MUST NOT remove or relocate a
+> committed message. It may only add ones an instance does not have. A stored
+> patch is a user's work; a server cannot read it, cannot judge it, and MUST NOT
+> delete it to make two logs agree.
 
-Two traps are worth recording, because both fail silently. `filterMessages`
-decides an operation was valid by a flag only `preserveRemaining()` sets, so a
-multi-line removal that never calls it has its work discarded as
-`HASH_NOT_FOUND`. And the store's `HK.getHash` is `msg.slice(0, 64)` of the raw
-content, while a federation id strips the `cp|<hash>|` checkpoint prefix first —
-matching on the former would fail to find precisely the checkpoints a busy pad
-has most of.
+That rule was learned the hard way. An earlier implementation excised its own
+unfederated messages and re-federated them so the merge would give both
+instances one identical order. It was wrong twice over. It deleted committed
+history for tidiness. And it could not distinguish an orphan from a message
+merely *in flight* — the only available evidence, "the peer does not have it", is
+true of both — so on a busy pad it cut out and re-sent correct messages, the
+divergence outlived the retry interval, and each round moved more. On a live
+pair a gap of 8 messages grew to 117 in three minutes. Appending cannot fail that
+way: the worst an in-flight message suffers is being sent twice and recognised
+by id.
+
+A related trap, in the detection rather than the repair: counting a committed log
+means reading all of it, so it must never sit on the heartbeat path. Making the
+beat wait for a count stopped the heartbeat on a slow read, and with it the
+watermark that keeps an idle channel committing. The count is cached and
+refreshed in the background; staleness is harmless, because a divergence
+persists and acting on one is rate-limited far beyond the cache's life.
 
 ---
 
@@ -1125,7 +1134,8 @@ support, **M6** hardening (quotas, budgets, admin tooling), **M7** the NextGraph
 | R-3 | Commit only up to the watermark `W`, in sort order | **done** — `Merge.partition` commits only `l <= W`, in sort order |
 | R-4 | Heartbeats keep `W` advancing when idle | **done** — Heartbeats carry each member's *promise* clock, so an idle channel still commits |
 | R-5 | Provisionally evict unreachable peers so `W` advances | **done** — A member silent for `EVICT_AFTER` stops holding the watermark back; a periodic sweep re-runs the merge so eviction alone can unblock it |
-| R-6 | Reconcile: a divergence is repaired rather than appended over | **done** — `AUDIT_REQ`/`AUDIT_IDS` compare committed logs; each instance excises its own orphans and re-federates them, so the merge places them identically on both. `federation-reconcile.test.js` covers two-sided and one-sided splits and pins that a healthy pad is never rewritten. Repair of a *late envelope* that sorts below the committed tip is still refused rather than spliced (R-48) |
+| R-6 | Reconcile: a divergence is repaired by making both instances hold everything | **done** — `AUDIT_REQ`/`AUDIT_IDS`/`REPAIR_MSG` compare committed logs and exchange what each lacks, append-only. `federation-reconcile.test.js` covers two-sided and one-sided splits, a repair racing live traffic from both instances, and pins that a healthy pad is untouched. Ordering across the repaired messages is left to the client (R-54). A *late envelope* sorting below the committed tip is still refused rather than spliced (R-48) |
+| R-54 | A repair never removes or relocates a committed message (§11e) | **done** — the repair only ever appends; the line-deletion primitives it once used have been removed from the stores entirely |
 | R-7 | Broadcast live without waiting for commitment | **done** — A remote edit is broadcast to local readers when it *arrives*, not when it commits; the live and committed tiers are deliberately different moments |
 | R-8 | History = committed prefix + sorted uncommitted tail | **done** — `getHistoryAsync` serves the committed prefix and then the sorted uncommitted tail |
 | R-9 | Persist before acknowledging a local client | **done** — A write is durable in the pending log before the client is acknowledged; the sequence is persisted before it is issued |

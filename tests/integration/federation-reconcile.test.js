@@ -18,11 +18,19 @@
  *  log that federation never saw — and there is no way to produce one through
  *  the normal path now that the window is closed, which is rather the point.
  *
- *  The repair must converge the two on the *union*, in one order. Re-sending an
- *  orphan is not enough and is actively wrong: it would arrive with a fresh
- *  clock and be appended at the peer's tail while it sits mid-log here, which is
- *  the divergence rather than the cure. So each instance lifts its own orphans
- *  out of its log and federates them properly, and the merge places them.
+ *  What the repair must achieve is that **both instances hold everything**. It
+ *  is append-only: a stored patch is somebody's work, and no server is in a
+ *  position to decide that a copy of it should stop existing — it cannot read the
+ *  content, and the party that can, the client, already resolves a chain it
+ *  receives out of order.
+ *
+ *  An earlier version tried to give both instances one identical order by
+ *  excising its own unfederated messages and re-federating them. It could not
+ *  tell an orphan from a message merely *in flight*, so on a busy pad it cut out
+ *  and re-sent perfectly good messages; the divergence outlived the retry
+ *  interval and each round moved more of them. On a live pair a gap of 8 grew to
+ *  117 in three minutes. These tests therefore assert the union and, explicitly,
+ *  that nothing is ever lost — not that the two logs are identical.
  */
 
 const { test } = require('node:test');
@@ -142,17 +150,29 @@ test('R-6: a pad split by orphans on both sides is repaired', async () => {
             return holdsEverything(h) ? h : null;
         }, 120000, 'B to hold the union');
 
-        /*  The whole point, and the reason re-sending is not enough: not the
-            same set, the same *sequence*. */
-        assert.deepStrictEqual(onB, onA,
-            'a repaired pad must leave both instances serving one identical order');
+        /*  Both hold everything. Order may differ — each instance keeps its own
+            messages where they are and appends what it was missing — and
+            reconciling that is the client's job. */
+        assert.strictEqual(onA.length, all.length,
+            'A must hold the union and nothing more');
+        assert.strictEqual(onB.length, all.length,
+            'B must hold the union and nothing more');
 
-        /*  And nothing may be duplicated: the orphan is lifted out of the log
-            before being federated, so it must appear exactly once. */
+        /*  Exactly once each. A repair races ordinary replication, so absorbing
+            the same message twice is the failure this guards. */
         all.forEach(m => {
             assert.strictEqual(onA.filter(x => x === m).length, 1,
-                'every message appears exactly once after a repair');
+                'no message may be stored twice by a repair');
+            assert.strictEqual(onB.filter(x => x === m).length, 1,
+                'no message may be stored twice by a repair');
         });
+
+        /*  And nothing was removed to achieve it: every message each instance
+            held before the repair it must still hold. */
+        seeded.concat(orphansA).forEach(m => assert.ok(onA.includes(m),
+            'A must not have lost anything it held'));
+        seeded.concat(orphansB).forEach(m => assert.ok(onB.includes(m),
+            'B must not have lost anything it held'));
     } finally {
         await rig.stop();
     }
@@ -179,14 +199,81 @@ test('R-6: orphans on one side only are repaired', async () => {
             return all.every(m => h.includes(m)) ? h : null;
         }, 120000, 'B to still hold everything');
 
-        assert.deepStrictEqual(onB, onA, 'both must agree on the order');
-        assert.strictEqual(onA.length, all.length, 'and hold nothing extra');
+        assert.strictEqual(onA.length, all.length, 'A holds the union, nothing extra');
+        assert.strictEqual(onB.length, all.length, 'B holds the union, nothing extra');
+        orphansB.forEach(m => assert.ok(onB.includes(m),
+            'and B still holds what was stranded on it'));
     } finally {
         await rig.stop();
     }
 });
 
-/*  A repair rewrites committed history, so it must not run on a healthy pad —
+/*  The case that broke the first implementation, and the reason this file exists
+    in its current form.
+
+    A repair runs against a pad people are still typing in, so at the moment it
+    compares logs some messages are legitimately *in flight*: federated, correct,
+    simply not committed on the peer yet. They are indistinguishable from orphans
+    by the only evidence available — the peer does not have them.
+
+    The first version excised what the peer lacked and re-federated it. On a busy
+    pad that meant cutting out perfectly good messages; the divergence outlived
+    the retry interval, the next round did it again, and a gap of 8 messages grew
+    to 117 in three minutes on a live pair. Appending cannot fail that way: the
+    worst an in-flight message can suffer is being sent twice and recognised.
+*/
+test('R-6: a repair running against live traffic neither loses nor duplicates', async () => {
+    const rig = await Rig.create(['A', 'B']);
+    try {
+        const { a, b, pad, padKeys, seeded } = await setup(rig);
+
+        await rig.killInstance(b);
+        const orphansB = await plantOrphans(b, pad, padKeys,
+            ['stranded-1', 'stranded-2', 'stranded-3']);
+        await rig.restartInstance(b);
+
+        /*  Keep writing from both sides while the repair happens, so it is
+            comparing logs that are moving under it. */
+        const clientA = await rig.client(a, pad, padKeys);
+        const clientB = await rig.client(b, pad, padKeys);
+        const live = [];
+        for (let i = 0; i < 8; i++) {
+            live.push(await clientA.send(`live-A-${i}`));
+            live.push(await clientB.send(`live-B-${i}`));
+        }
+
+        const all = seeded.concat(orphansB, live);
+        const settled = async (inst) => {
+            const h = await rig.history(inst, pad);
+            return all.every(m => h.includes(m)) ? h : null;
+        };
+
+        const onA = await until(() => settled(a), 120000, 'A to hold everything');
+        const onB = await until(() => settled(b), 120000, 'B to hold everything');
+
+        /*  The failure mode was unbounded growth, so the count is the assertion
+            that matters: exactly the union, on both, however much traffic
+            crossed the repair. */
+        assert.strictEqual(onA.length, all.length,
+            `A grew beyond the union: ${onA.length} vs ${all.length}`);
+        assert.strictEqual(onB.length, all.length,
+            `B grew beyond the union: ${onB.length} vs ${all.length}`);
+
+        all.forEach(m => {
+            assert.strictEqual(onA.filter(x => x === m).length, 1,
+                'a message caught mid-flight by a repair must be stored once');
+            assert.strictEqual(onB.filter(x => x === m).length, 1,
+                'a message caught mid-flight by a repair must be stored once');
+        });
+
+        await clientA.close();
+        await clientB.close();
+    } finally {
+        await rig.stop();
+    }
+});
+
+/*  A repair costs a log rewrite on the peer, so it must not run on a healthy pad —
     and detection must not mistake a moment of lag for a divergence. */
 test('R-6: a pad that agrees is left alone', async () => {
     const rig = await Rig.create(['A', 'B']);

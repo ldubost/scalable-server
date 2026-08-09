@@ -106,6 +106,7 @@ const FEDERATION_COMMANDS = {
     // repairing a split pad (R-6)
     'AUDIT_REQ': Sync.onAuditRequest,
     'AUDIT_IDS': Sync.onAuditIds,
+    'REPAIR_MSG': Sync.onRepairMessages,
 
     // blobs (M5)
     'BLOB_REQ': BlobTransfer.onRequest,
@@ -554,6 +555,10 @@ const start = (mainConfig) => {
         // repairs in flight, and when each channel was last repaired (R-6)
         repairs: new Map(),
         repairedAt: new Map(),
+        /*  Cached committed-log lengths (R-53). Counting means reading the whole
+            log, so it is refreshed in the background and never on the beat. */
+        logCounts: new Map(),
+        logCountsInFlight: new Set(),
         federationCommands: FEDERATION_COMMANDS
     };
     Environment.init(Env, mainConfig);

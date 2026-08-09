@@ -396,26 +396,72 @@ const create = (Env) => {
         });
     };
 
-    /*  Lift a set of messages out of the committed log and hand back their
-        contents, so they can be federated properly (R-6).
+    /*  Take in messages a peer holds and we do not (spec R-6).
 
-        This is the one operation in the whole design that *removes* committed
-        history, so it is deliberately narrow: it takes an explicit list of ids,
-        returns exactly what it removed, and does nothing else. The caller
-        re-federates those contents through the ordinary path, where the merge
-        gives them positions both instances agree on — which is the entire point,
-        since their problem was never having had one.
+        Append-only, and deliberately so. A stored patch is somebody's work: the
+        repair's job is to make sure both instances hold *everything*, never to
+        decide that one copy should stop existing. Reconciling the resulting
+        history is the client's business — it holds the keys, it can read the
+        content, and ChainPad already resolves a chain it receives out of order.
+        A server rearranging patches it cannot read to second-guess that was the
+        wrong instinct, and an actively destructive one.
 
-        Contents are read before the rewrite, not after: if the rewrite succeeds
-        and the read fails, the messages are gone.
+        Ids are checked against the whole log first, so absorbing the same
+        message twice is a no-op. That matters more than it looks: a repair
+        routinely races the ordinary replication path, and without this a message
+        that was merely *in flight* would be stored a second time.
     */
-    FM.excise = (channel, ids, cb) => {
+    FM.absorb = (channel, messages, cb) => {
+        const list = Array.isArray(messages) ? messages : [];
+        if (!list.length) { return void cb(void 0, { absorbed: 0 }); }
+
+        FM.logIds(channel, (err, res) => {
+            if (err) { return void cb(err); }
+            const have = new Set(res?.ids || []);
+
+            const missing = [];
+            list.forEach(m => {
+                if (!m || typeof (m.content) !== 'string') { return; }
+                let id;
+                try { id = Ids.fromContent(m.content); } catch (e) { return; }
+                if (have.has(id)) { return; }
+                have.add(id);          // guard against duplicates within one batch
+                missing.push(m);
+            });
+            if (!missing.length) { return void cb(void 0, { absorbed: 0 }); }
+
+            let i = 0;
+            const step = () => {
+                if (i >= missing.length) {
+                    Env.Log.info('FEDERATION_ABSORBED', {
+                        channel, count: missing.length
+                    });
+                    return void cb(void 0, { absorbed: missing.length });
+                }
+                const m = missing[i++];
+                const line = JSON.stringify([0, 'repair', 'MSG', channel,
+                    m.content, m.time || Date.now()]);
+                Env.queueStorage(channel, next => {
+                    Env.store.messageBin(channel, Buffer.from(line + '\n', 'utf8'), (e) => {
+                        if (e) {
+                            next();
+                            return void cb(e);
+                        }
+                        const chan = Env.channel_cache[channel];
+                        if (chan) { delete chan.index; }
+                        next();
+                        setTimeout(step, 0);
+                    });
+                });
+            };
+            step();
+        });
+    };
+
+    /*  The contents behind a set of ids, for handing to a peer that lacks them. */
+    FM.contentsFor = (channel, ids, cb) => {
         const wanted = new Set(Array.isArray(ids) ? ids : []);
         if (!wanted.size) { return void cb(void 0, { messages: [] }); }
-        if (typeof (Env.store.deleteChannelLines) !== 'function') {
-            return void cb(new Error('E_NO_EXCISE'));
-        }
-
         const messages = [];
         Env.store.readMessagesBin(channel, 0, (msgObj, readMore) => {
             let line;
@@ -428,23 +474,13 @@ const create = (Env) => {
                 const content = parsed[4];
                 if (typeof (content) === 'string') {
                     const id = Ids.fromContent(content);
-                    if (wanted.has(id)) {
-                        messages.push({ id, content, time: parsed[5] });
-                    }
+                    if (wanted.has(id)) { messages.push({ content, time: parsed[5] }); }
                 }
             } catch (e) { /* skip unreadable line */ }
             readMore();
         }, (err) => {
             if (err && !missing(err)) { return void cb(err); }
-            if (!messages.length) { return void cb(void 0, { messages: [] }); }
-
-            Env.store.deleteChannelLines(channel, messages.map(m => m.id), (e) => {
-                if (e) { return void cb(e); }
-                Env.Log.info('FEDERATION_EXCISED', {
-                    channel, count: messages.length
-                });
-                cb(void 0, { messages });
-            });
+            cb(void 0, { messages });
         });
     };
 
